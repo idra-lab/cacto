@@ -4,10 +4,10 @@ import numpy as np
 system_id = 'car_park'
 
 ''' CACTO parameters '''
-EP_UPDATE = 200                                                                                             # Number of episodes before updating critic and actor
 NUPDATES = 260000                                                                                           # Max NNs updates
-UPDATE_LOOPS = np.arange(1000, 38000, 3000)                                                                 # Number of updates of both critic and actor performed every EP_UPDATE episodes                                                                           
-NEPISODES = int(EP_UPDATE*len(UPDATE_LOOPS))                                                                # Max training episodes
+UPDATE_LOOPS = np.clip(np.arange(1000, 100000, 3000), 0, 1.5e4)                                                                 # Number of updates of both critic and actor performed every EP_UPDATE episodes                                                                           
+EP_UPDATE = 400 #*np.ones(len(UPDATE_LOOPS))                                                                                             # Number of episodes before updating critic and actor
+NEPISODES = int(EP_UPDATE*len(UPDATE_LOOPS)) #int(sum(EP_UPDATE)                                                                # Max training episodes
 NLOOPS = len(UPDATE_LOOPS)                                                                                  # Number of algorithm loops
 NSTEPS = 100                                                                                                # Max episode length
 CRITIC_LEARNING_RATE = 5e-4                                                                                 # Learning rate for the critic network

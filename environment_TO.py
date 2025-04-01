@@ -1,8 +1,95 @@
-import sys
-import math
+import jax
 import casadi
 import numpy as np
 import pinocchio.casadi as cpin
+from jaxadi import convert
+
+class OneD_CAMS:
+    def __init__(self, name, conf):
+        '''
+        :name :                                 (str) Name of the casadi-model (either 'running' or 'terminal')
+
+        :input conf :                           (Configuration file)
+
+            :param robot :                      (RobotWrapper instance) 
+            :param cmodel :                     (Casadi-Pinocchio instance)
+            :param cdata :                      (Casadi-Pinocchio model data)
+            :param dt :                         (float) Timestep
+            :param end_effector_frame_id :      (str) Name of EE-frame
+
+            # Cost function parameters
+            :param TARGET_STATE :               (float array) Target position
+            :param cost_funct_param             (float array) Cost function scale and offset factors
+            :param soft_max_param :             (float array) Soft parameters array
+            :param obs_param :                  (float array) Obtacle parameters array
+            :param cost_weights_running :       (float array) Running cost weights vector
+            :param cost_weights_terminal :      (float array) Terminal cost weights vector
+        '''
+        self.name = name
+        self.conf = conf
+        
+        self.nx = self.conf.nx
+        self.nu = self.conf.na
+
+        # The self.xdot will be a casadi function mapping:  state,control -> [velocity,acceleration]
+        cx = casadi.SX.sym("x",self.nx,1)
+        cu = casadi.SX.sym("u",self.nu,1)
+
+        self.x_next = casadi.Function('x_next', [cx, cu], [self.simulate_fun(cx,cu)])
+
+        self.p_ee = casadi.Function('p_ee', [cx], [self.get_end_effector_position_fun(cx)])
+
+        if self.name == 'running_model':
+            self.weights = np.copy(self.conf.cost_weights_running)
+        elif self.name == 'terminal_model':
+            self.weights = np.copy(self.conf.cost_weights_terminal)
+        else:
+            print("The model can be either 'running_model' or 'terminal_model'")
+            import sys
+            sys.exit()
+
+        self.cost = casadi.Function('cost', [cx,cu], [self.cost_fun(cx,cu)])
+
+    def get_end_effector_position_fun(self, cx):      
+        p_ee = casadi.SX(3,1)
+        p_ee[0] = cx[:1]
+        p_ee[1] = 0 
+        p_ee[2] = 0
+
+        return p_ee
+    
+    def bound_control_cost(self, action):
+        u_cost = 0
+        for i in range(self.conf.nb_action):
+            u_cost += action[i]*action[i] + self.conf.w_b*(action[i]/self.conf.u_max[i])**8
+
+        return u_cost
+    
+    def cost_fun(self, x, u, sign=1):
+        ''' Compute cost '''
+        ### Control effort term ###
+        u_cost = self.bound_control_cost(u)
+
+        cost = 0.15*u[0]*u[0] + (x[0]-1.9)*(x[0]-1.0)*(x[0]-0.6)*(x[0]+0.5)*(x[0]+1.2)*(x[0]+2.1)*sign
+        #cost = (x[0] - 1.9)*(x[0] - 1.0)*(x[0] - 0.6)*(x[0] + 0.5)*(x[0] + 1.2)*(x[0] + 2.1) + self.weights[0]*u_cost
+
+        return cost
+    
+    def simulate_fun(self, x, u):
+        ''' Integrate dynamics '''
+        x_next = casadi.SX(self.conf.nx,1)
+        x_next[0] = 0.8*x[0] + 0.1*u[0]
+        #x_next[0] = x[0] + self.conf.dt*u[0]
+        
+        return x_next
+    
+    def step_fun(self, x, u):
+        ''' Return next state and cost '''
+        cost = self.cost(x, u)
+        
+        x_next = self.x_next(x,u)
+        
+        return x_next, cost
     
 class SingleIntegrator_CAMS:
     def __init__(self, name, conf):
@@ -58,10 +145,6 @@ class SingleIntegrator_CAMS:
         cx = casadi.SX.sym("x",self.nx,1)
         cu = casadi.SX.sym("u",self.nu,1)
 
-        self.x_next = casadi.Function('x_next', [cx, cu], [self.simulate_fun(cx,cu)])
-
-        self.p_ee = casadi.Function('p_ee', [cx], [self.get_end_effector_position_fun(cx)])
-
         if self.name == 'running_model':
             self.weights = np.copy(self.conf.cost_weights_running)
         elif self.name == 'terminal_model':
@@ -70,7 +153,12 @@ class SingleIntegrator_CAMS:
             print("The model can be either 'running_model' or 'terminal_model'")
             import sys
             sys.exit()
-
+        
+        self.p_ee = casadi.Function('p_ee', [cx], [self.get_end_effector_position_fun(cx)])
+        
+        self.rnea = casadi.Function('rnea', [cx, cu], [cu])
+        
+        self.x_next = casadi.Function('x_next', [cx, cu], [self.simulate_fun(cx,cu)])
         self.cost = casadi.Function('cost', [cx,cu], [self.cost_fun(cx,cu)])
 
     def get_end_effector_position_fun(self, cx):      
@@ -83,7 +171,7 @@ class SingleIntegrator_CAMS:
     def bound_control_cost(self, action):
         u_cost = 0
         for i in range(self.conf.nb_action):
-            u_cost += action[i]*action[i] + self.conf.w_b*(action[i]/self.conf.u_max[i])**10
+            u_cost += action[i]*action[i] + self.conf.w_b*(action[i]/self.conf.u_max[i])**8
 
         return u_cost
     
@@ -97,8 +185,7 @@ class SingleIntegrator_CAMS:
         ell3_cost = (np.log(np.exp(self.alpha*-(((p_ee[0]-self.XC3)**2)/((self.A3/2)**2) + ((p_ee[1]-self.YC3)**2)/((self.B3/2)**2) - 1.0)) + 1)/self.alpha)
 
         ### Control effort term ###
-        if u is not None:
-            u_cost = self.bound_control_cost(u)
+        u_cost = self.bound_control_cost(u)
 
         ### Distence to target term (quadratic term) ###
         dist_cost = (p_ee[0]-self.x_des)**2 + (p_ee[1]-self.y_des)**2
@@ -180,12 +267,9 @@ class DoubleIntegrator_CAMS:
 
         # The self.xdot will be a casadi function mapping:  state,control -> [velocity,acceleration]
         cx = casadi.SX.sym("x",self.nx,1)
+        cxt = casadi.SX.sym("x",self.nx+1,1)
         cu = casadi.SX.sym("u",self.nu,1)
 
-        self.x_next = casadi.Function('x_next', [cx, cu], [self.simulate_fun(cx,cu)])
-
-        cpin.framesForwardKinematics(self.conf.cmodel, self.conf.cdata,cx[:self.nq])
-        self.p_ee = casadi.Function('p_ee', [cx], [self.conf.cdata.oMf[self.conf.robot.model.getFrameId(self.conf.end_effector_frame_id)].translation])
 
         if self.name == 'running_model':
             self.weights = np.copy(self.conf.cost_weights_running)
@@ -196,38 +280,75 @@ class DoubleIntegrator_CAMS:
             import sys
             sys.exit()
 
-        self.cost = casadi.Function('cost', [cx,cu], [self.cost_fun(cx,cu)])
+        cpin.framesForwardKinematics(self.conf.cmodel, self.conf.cdata,cx[:self.nq])
+        self.rnea = casadi.Function('rnea', [cx, cu], [cpin.rnea(self.conf.cmodel, self.conf.cdata, cx[:self.conf.nq], cx[self.conf.nq:], cu)])
+        self.p_ee = casadi.Function('p_ee', [cx], [self.conf.cdata.oMf[self.conf.robot.model.getFrameId(self.conf.end_effector_frame_id)].translation]) #self.get_end_effector_position_fun(cx)])#
+        self.cost = casadi.Function('cost', [cx,cu], [self.cost_fun(cx, cu)])
+        self.cost_aug_tau = casadi.Function('cost', [cxt,cu], [self.cost_fun_aug_tau(cxt,cu)])
+        self.x_next = casadi.Function('x_next', [cx, cu], [self.simulate_fun(cx,cu)])
+        #self.x_next_aug = casadi.Function('x_next', [cxt, cu], [self.simulate_fun_aug(cxt,cu)])
+        self.x_next_aug_tau = casadi.Function('aba', [cxt, cu], list(self.simulate_fun_aug_tau(cxt,cu)))
+        self.x_next_aug_tau_so = casadi.Function('aba', [cxt, cu], [self.simulate_fun_aug_tau_so(cxt,cu)])
+        self.dx_next_du = casadi.Function('d_x_next_dx', [cxt, cu], [casadi.jacobian(self.simulate_fun_aug_tau_so(cxt,cu),cu)])
+        self.check_feasible = casadi.Function('check_ICS_feasible', [cxt], [self.check_ICS_feasible(cxt)])
+
+        self.p_ee_jax = jax.jit(convert(self.p_ee))
 
     def bound_control_cost(self, action):
         u_cost = 0
         for i in range(self.conf.nb_action):
-            u_cost += action[i]*action[i] + self.conf.w_b*(action[i]/self.conf.u_max[i])**10
+            u_cost += action[i]*action[i] + self.conf.w_b*(action[i]/self.conf.u_max[i])**8
 
         return u_cost
 
     def cost_fun(self, x, u):
         ''' Compute cost '''
+        cpin.framesForwardKinematics(self.conf.cmodel, self.conf.cdata,x[:self.nq])
         p_ee = self.p_ee(x)
 
         ### Penalties representing the obstacle ###
-        ell1_cost = (np.log(np.exp(self.alpha*-(((p_ee[0]-self.XC1)**2)/((self.A1/2)**2) + ((p_ee[1]-self.YC1)**2)/((self.B1/2)**2) - 1.0)) + 1)/self.alpha)  
-        ell2_cost = (np.log(np.exp(self.alpha*-(((p_ee[0]-self.XC2)**2)/((self.A2/2)**2) + ((p_ee[1]-self.YC2)**2)/((self.B2/2)**2) - 1.0)) + 1)/self.alpha) 
-        ell3_cost = (np.log(np.exp(self.alpha*-(((p_ee[0]-self.XC3)**2)/((self.A3/2)**2) + ((p_ee[1]-self.YC3)**2)/((self.B3/2)**2) - 1.0)) + 1)/self.alpha)
+        ell1_cost = (casadi.log(casadi.exp(self.alpha*-(((p_ee[0]-self.XC1)**2)/((self.A1/2)**2) + ((p_ee[1]-self.YC1)**2)/((self.B1/2)**2) - 1.0)) + 1)/self.alpha)  
+        ell2_cost = (casadi.log(casadi.exp(self.alpha*-(((p_ee[0]-self.XC2)**2)/((self.A2/2)**2) + ((p_ee[1]-self.YC2)**2)/((self.B2/2)**2) - 1.0)) + 1)/self.alpha) 
+        ell3_cost = (casadi.log(casadi.exp(self.alpha*-(((p_ee[0]-self.XC3)**2)/((self.A3/2)**2) + ((p_ee[1]-self.YC3)**2)/((self.B3/2)**2) - 1.0)) + 1)/self.alpha)
 
         ### Control effort term ###
-        if u is not None:
-            u_cost = self.bound_control_cost(u)
+        u_cost = self.bound_control_cost(self.rnea(x,u)) #self.bound_control_cost(u)
 
         ### Distence to target term (quadratic term) ###
         dist_cost = (p_ee[0]-self.x_des)**2 + (p_ee[1]-self.y_des)**2
 
         ### Distence to target term (log valley centered at target) ###      
-        peak_rew = np.log(np.exp(self.alpha2*-(np.sqrt((p_ee[0]-self.x_des)**2 +0.1) - 0.1 + np.sqrt((p_ee[1]-self.y_des)**2 +0.1) - 0.1 -2*np.sqrt(0.1))) + 1)/self.alpha2
+        peak_rew = casadi.log(casadi.exp(self.alpha2*-(casadi.sqrt((p_ee[0]-self.x_des)**2 +0.1) - 0.1 + casadi.sqrt((p_ee[1]-self.y_des)**2 +0.1) - 0.1 -2*casadi.sqrt(0.1))) + 1)/self.alpha2
         
         ### Terminal cost on final velocity ###
         v_cost = 0
-        for i in range(self.nv):
-            v_cost += x[i+self.nq]**2
+        
+        cost = self.scale*(self.weights[0]*dist_cost - self.weights[1]*peak_rew + self.weights[2]*v_cost + self.weights[3]*ell1_cost + self.weights[4]*ell2_cost + self.weights[5]*ell3_cost + self.weights[6]*u_cost - self.offset)
+ 
+        return cost
+    
+    def cost_fun_aug_tau(self, x, u):
+        ''' Compute cost '''
+        cpin.framesForwardKinematics(self.conf.cmodel, self.conf.cdata,x[:self.nq])
+        x = x[:-1]
+        p_ee = self.p_ee(x)
+
+        ### Penalties representing the obstacle ###
+        ell1_cost = (casadi.log(casadi.exp(self.alpha*-(((p_ee[0]-self.XC1)**2)/((self.A1/2)**2) + ((p_ee[1]-self.YC1)**2)/((self.B1/2)**2) - 1.0)) + 1)/self.alpha)  
+        ell2_cost = (casadi.log(casadi.exp(self.alpha*-(((p_ee[0]-self.XC2)**2)/((self.A2/2)**2) + ((p_ee[1]-self.YC2)**2)/((self.B2/2)**2) - 1.0)) + 1)/self.alpha) 
+        ell3_cost = (casadi.log(casadi.exp(self.alpha*-(((p_ee[0]-self.XC3)**2)/((self.A3/2)**2) + ((p_ee[1]-self.YC3)**2)/((self.B3/2)**2) - 1.0)) + 1)/self.alpha)
+
+        ### Control effort term ###
+        u_cost = self.bound_control_cost(u) #self.bound_control_cost(u)
+
+        ### Distence to target term (quadratic term) ###
+        dist_cost = (p_ee[0]-self.x_des)**2 + (p_ee[1]-self.y_des)**2
+
+        ### Distence to target term (log valley centered at target) ###      
+        peak_rew = casadi.log(casadi.exp(self.alpha2*-(casadi.sqrt((p_ee[0]-self.x_des)**2 +0.1) - 0.1 + casadi.sqrt((p_ee[1]-self.y_des)**2 +0.1) - 0.1 -2*casadi.sqrt(0.1))) + 1)/self.alpha2
+        
+        ### Terminal cost on final velocity ###
+        v_cost = 0
         
         cost = self.scale*(self.weights[0]*dist_cost - self.weights[1]*peak_rew + self.weights[2]*v_cost + self.weights[3]*ell1_cost + self.weights[4]*ell2_cost + self.weights[5]*ell3_cost + self.weights[6]*u_cost - self.offset)
  
@@ -235,13 +356,39 @@ class DoubleIntegrator_CAMS:
     
     def simulate_fun(self, x, u):
         ''' Integrate dynamics '''
-        a = cpin.aba(self.conf.cmodel,self.conf.cdata,x[:self.nq],x[self.nq:],u)
+        a = u
+        x_next = x + self.conf.dt*casadi.vertcat(x[self.nq:], a)
         
-        if self.conf.integration_scheme == 'SI-Euler':
-            F = casadi.vertcat(x[self.nq:]+self.dt*a, a)
-        elif self.conf.integration_scheme == 'E-Euler':
-            F = casadi.vertcat(x[self.nq:], a)
-        x_next = x + self.conf.dt*F
+        return x_next
+
+    def simulate_fun_aug(self, x, u):
+        ''' Integrate dynamics '''
+        a = u
+        x_next = x + self.conf.dt*casadi.vertcat(x[self.nq:-1], a, 1.0)
+
+        return x_next
+    
+    def simulate_fun_aug_tau(self, x, u):
+        ''' Integrate dynamics '''
+        cpin.framesForwardKinematics(self.conf.cmodel, self.conf.cdata,x[:self.nq])
+        M = cpin.crba(self.conf.cmodel, self.conf.cdata, x[:self.nq])
+        tau_rnea = cpin.rnea(self.conf.cmodel, self.conf.cdata, x[:self.nq], x[self.nq:-1], casadi.SX.zeros(self.nq))    
+        a = casadi.solve(M, u - tau_rnea)
+        #a = cpin.aba(self.conf.cmodel,self.conf.cdata,x[:self.nq],x[self.nq:-1],u)
+        
+        x_next = x + self.conf.dt*casadi.vertcat(x[self.nq:-1], a, 1)
+        
+        return x_next, a
+    
+    def simulate_fun_aug_tau_so(self, x, u):
+        ''' Integrate dynamics '''
+        cpin.framesForwardKinematics(self.conf.cmodel, self.conf.cdata,x[:self.nq])
+        M = cpin.crba(self.conf.cmodel, self.conf.cdata, x[:self.nq])
+        tau_rnea = cpin.rnea(self.conf.cmodel, self.conf.cdata, x[:self.nq], x[self.nq:-1], casadi.SX.zeros(self.nq))    
+        a = casadi.solve(M, u - tau_rnea)
+        #a = cpin.aba(self.conf.cmodel,self.conf.cdata,x[:self.nq],x[self.nq:-1],u)
+        
+        x_next = x + self.conf.dt*casadi.vertcat(x[self.nq:-1], a, 1)
         
         return x_next
     
@@ -252,6 +399,22 @@ class DoubleIntegrator_CAMS:
         x_next = self.x_next(x,u)
         
         return x_next, cost
+    
+    def check_ICS_feasible(self, x):
+        ''' Check if ICS is feasible using JAX '''
+        cpin.framesForwardKinematics(self.conf.cmodel, self.conf.cdata,x[:self.nq])
+        x = x[:-1]
+        p_ee = self.p_ee(x)
+        
+        ellipses = casadi.vertcat(
+        ((p_ee[0] - self.conf.XC1) ** 2) / ((self.conf.A1 / 2) ** 2) + ((p_ee[1] - self.conf.YC1) ** 2) / ((self.conf.B1 / 2) ** 2),
+        ((p_ee[0] - self.conf.XC2) ** 2) / ((self.conf.A2 / 2) ** 2) + ((p_ee[1] - self.conf.YC2) ** 2) / ((self.conf.B2 / 2) ** 2),
+        ((p_ee[0] - self.conf.XC3) ** 2) / ((self.conf.A3 / 2) ** 2) + ((p_ee[1] - self.conf.YC3) ** 2) / ((self.conf.B3 / 2) ** 2),
+        )
+
+        feasible_flags = casadi.mmin(ellipses) > 1
+
+        return feasible_flags  
     
 class Car_CAMS:
     def __init__(self, name, conf):
@@ -307,10 +470,6 @@ class Car_CAMS:
         cx = casadi.SX.sym("x",self.nx,1)
         cu = casadi.SX.sym("u",self.nu,1)
 
-        self.x_next = casadi.Function('x_next', [cx, cu], [self.simulate_fun(cx,cu)])
-
-        self.p_ee = casadi.Function('p_ee', [cx], [self.get_end_effector_position_fun(cx)])
-
         if self.name == 'running_model':
             self.weights = np.copy(self.conf.cost_weights_running)
         elif self.name == 'terminal_model':
@@ -320,6 +479,12 @@ class Car_CAMS:
             import sys
             sys.exit()
 
+        cpin.framesForwardKinematics(self.conf.cmodel, self.conf.cdata,cx[:self.nq])
+        self.p_ee = casadi.Function('p_ee', [cx], [self.get_end_effector_position_fun(cx)])
+        
+        self.rnea = casadi.Function('rnea', [cx, cu], [cu])
+        
+        self.x_next = casadi.Function('x_next', [cx, cu], [self.simulate_fun(cx,cu)])
         self.cost = casadi.Function('cost', [cx,cu], [self.cost_fun(cx,cu)])
 
     def get_end_effector_position_fun(self, cx):        
@@ -332,7 +497,7 @@ class Car_CAMS:
     def bound_control_cost(self, action):
         u_cost = 0
         for i in range(self.conf.nb_action):
-            u_cost += action[i]*action[i] + self.conf.w_b*(action[i]/self.conf.u_max[i])**10
+            u_cost += action[i]*action[i] + self.conf.w_b*(action[i]/self.conf.u_max[i])**8
 
         return u_cost
     
@@ -346,8 +511,7 @@ class Car_CAMS:
         ell3_cost = (np.log(np.exp(self.alpha*-(((p_ee[0]-self.XC3)**2)/((self.A3/2)**2) + ((p_ee[1]-self.YC3)**2)/((self.B3/2)**2) - 1.0)) + 1)/self.alpha)
 
         ### Control effort term ###
-        if u is not None:
-            u_cost = self.bound_control_cost(u)
+        u_cost = self.bound_control_cost(u)
 
         ### Distence to target term (quadratic term) ###
         dist_cost = (p_ee[0]-self.x_des)**2 + (p_ee[1]-self.y_des)**2
@@ -463,7 +627,7 @@ class CarPark_CAMS:
     def bound_control_cost(self, action):
         u_cost = 0
         for i in range(self.conf.nb_action):
-            u_cost += action[i]*action[i] + self.conf.w_b*(action[i]/self.conf.u_max[i])**10
+            u_cost += action[i]*action[i] + self.conf.w_b*(action[i]/self.conf.u_max[i])**8
 
         return u_cost
     
@@ -577,12 +741,8 @@ class Manipulator_CAMS:
 
         # The self.xdot will be a casadi function mapping:  state,control -> [velocity,acceleration]
         cx = casadi.SX.sym("x",self.nx,1)
+        cxt = casadi.SX.sym("x",self.nx+1,1)
         cu = casadi.SX.sym("u",self.nu,1)
-
-        self.x_next = casadi.Function('x_next', [cx, cu], [self.simulate_fun(cx,cu)])
-
-        cpin.framesForwardKinematics(self.conf.cmodel, self.conf.cdata,cx[:self.nq])
-        self.p_ee = casadi.Function('p_ee', [cx], [self.conf.cdata.oMf[self.conf.robot.model.getFrameId(self.conf.end_effector_frame_id)].translation])
 
         if self.name == 'running_model':
             self.weights = np.copy(self.conf.cost_weights_running)
@@ -593,17 +753,31 @@ class Manipulator_CAMS:
             import sys
             sys.exit()
 
-        self.cost = casadi.Function('cost', [cx,cu], [self.cost_fun(cx,cu)])
+        cpin.framesForwardKinematics(self.conf.cmodel, self.conf.cdata,cx[:self.nq])
+        self.rnea = casadi.Function('rnea', [cx, cu], [cpin.rnea(self.conf.cmodel, self.conf.cdata, cx[:self.conf.nq], cx[self.conf.nq:], cu)])
+        self.p_ee = casadi.Function('p_ee', [cx], [self.conf.cdata.oMf[self.conf.robot.model.getFrameId(self.conf.end_effector_frame_id)].translation]) #self.get_end_effector_position_fun(cx)])#
+        self.cost = casadi.Function('cost', [cx,cu], [self.cost_fun(cx, cu)])
+        self.cost_aug_tau = casadi.Function('cost', [cxt,cu], [self.cost_fun_aug_tau(cxt,cu)])
+        self.x_next = casadi.Function('x_next', [cx, cu], [self.simulate_fun(cx,cu)])
+        #self.x_next_aug = casadi.Function('x_next', [cxt, cu], [self.simulate_fun_aug(cxt,cu)])
+        self.x_next_aug_tau = casadi.Function('aba', [cxt, cu], list(self.simulate_fun_aug_tau(cxt,cu)))
+        self.x_next_aug_tau_so = casadi.Function('aba', [cxt, cu], [self.simulate_fun_aug_tau_so(cxt,cu)])
+        self.dx_next_du = casadi.Function('d_x_next_dx', [cxt, cu], [casadi.jacobian(self.simulate_fun_aug_tau_so(cxt,cu),cu)])
+        self.check_feasible = casadi.Function('check_ICS_feasible', [cxt], [self.check_ICS_feasible(cxt)])
+
+        self.p_ee_jax = jax.jit(convert(self.p_ee))
 
     def bound_control_cost(self, action):
         u_cost = 0
         for i in range(self.conf.nb_action):
-            u_cost += action[i]*action[i] + self.conf.w_b*(action[i]/self.conf.u_max[i])**10
+            u_cost += action[i]*action[i] + self.conf.w_b*(action[i]/self.conf.u_max[i])**6
 
         return u_cost
     
     def cost_fun(self, x, u):
         ''' Compute cost '''
+        cpin.framesForwardKinematics(self.conf.cmodel, self.conf.cdata,x[:self.nq])
+
         p_ee = self.p_ee(x)
 
         ### Penalties representing the obstacle ###
@@ -612,8 +786,7 @@ class Manipulator_CAMS:
         ell3_cost = (np.log(np.exp(self.alpha*-(((p_ee[0]-self.XC3)**2)/((self.A3/2)**2) + ((p_ee[1]-self.YC3)**2)/((self.B3/2)**2) - 1.0)) + 1)/self.alpha)
 
         ### Control effort term ###
-        if u is not None:
-            u_cost = self.bound_control_cost(u)
+        u_cost = self.bound_control_cost(self.rnea(x,u))
 
         ### Distence to target term (quadratic term) ###
         dist_cost = (p_ee[0]-self.x_des)**2 + (p_ee[1]-self.y_des)**2
@@ -623,8 +796,35 @@ class Manipulator_CAMS:
         
         ### Terminal cost on final velocity ###
         v_cost = 0
-        for i in range(self.nv):
-            v_cost += x[i+self.nq]**2
+        
+        cost = self.scale*(self.weights[0]*dist_cost - self.weights[1]*peak_rew + self.weights[2]*v_cost + self.weights[3]*ell1_cost + self.weights[4]*ell2_cost + self.weights[5]*ell3_cost + self.weights[6]*u_cost - self.offset)
+ 
+        return cost
+    
+    def cost_fun_aug_tau(self, x, u):
+        ''' Compute cost '''
+        x = x[:-1]
+
+        cpin.framesForwardKinematics(self.conf.cmodel, self.conf.cdata,x[:self.nq])
+
+        p_ee = self.p_ee(x)
+
+        ### Penalties representing the obstacle ###
+        ell1_cost = (casadi.log(casadi.exp(self.alpha*-(((p_ee[0]-self.XC1)**2)/((self.A1/2)**2) + ((p_ee[1]-self.YC1)**2)/((self.B1/2)**2) - 1.0)) + 1)/self.alpha)  
+        ell2_cost = (casadi.log(casadi.exp(self.alpha*-(((p_ee[0]-self.XC2)**2)/((self.A2/2)**2) + ((p_ee[1]-self.YC2)**2)/((self.B2/2)**2) - 1.0)) + 1)/self.alpha) 
+        ell3_cost = (casadi.log(casadi.exp(self.alpha*-(((p_ee[0]-self.XC3)**2)/((self.A3/2)**2) + ((p_ee[1]-self.YC3)**2)/((self.B3/2)**2) - 1.0)) + 1)/self.alpha)
+
+        ### Control effort term ###
+        u_cost = self.bound_control_cost(u) #self.bound_control_cost(u)
+
+        ### Distence to target term (quadratic term) ###
+        dist_cost = (p_ee[0]-self.x_des)**2 + (p_ee[1]-self.y_des)**2
+
+        ### Distence to target term (log valley centered at target) ###      
+        peak_rew = casadi.log(casadi.exp(self.alpha2*-(casadi.sqrt((p_ee[0]-self.x_des)**2 +0.1) - 0.1 + casadi.sqrt((p_ee[1]-self.y_des)**2 +0.1) - 0.1 -2*casadi.sqrt(0.1))) + 1)/self.alpha2
+        
+        ### Terminal cost on final velocity ###
+        v_cost = 0
         
         cost = self.scale*(self.weights[0]*dist_cost - self.weights[1]*peak_rew + self.weights[2]*v_cost + self.weights[3]*ell1_cost + self.weights[4]*ell2_cost + self.weights[5]*ell3_cost + self.weights[6]*u_cost - self.offset)
  
@@ -632,13 +832,43 @@ class Manipulator_CAMS:
     
     def simulate_fun(self, x, u):
         ''' Integrate dynamics '''
-        a = cpin.aba(self.conf.cmodel,self.conf.cdata,x[:self.nq],x[self.nq:],u)
+        a = u
+        x_next = x + self.conf.dt*casadi.vertcat(x[self.nq:], a)
         
-        if self.conf.integration_scheme == 'SI-Euler':
-            F = casadi.vertcat(x[self.nq:]+self.dt*a, a)
-        elif self.conf.integration_scheme == 'E-Euler':
-            F = casadi.vertcat(x[self.nq:], a)
-        x_next = x + self.conf.dt*F
+        return x_next
+    
+    def simulate_fun_aug(self, x, u):
+        ''' Integrate dynamics '''
+        a = u
+        x_next = x + self.conf.dt*casadi.vertcat(x[self.nq:-1], a, 1)
+
+        return x_next
+    
+    def simulate_fun_aug_tau(self, x, u):
+        ''' Integrate dynamics '''
+        cpin.framesForwardKinematics(self.conf.cmodel, self.conf.cdata,x[:self.nq])
+
+        # ddq = (u - tau_rnea) / M(q) == cpin.aba(self.conf.cmodel,self.conf.cdata,x[:self.nq],x[self.nq:-1],u)
+        M = cpin.crba(self.conf.cmodel, self.conf.cdata, x[:self.nq])
+        tau_rnea = cpin.rnea(self.conf.cmodel, self.conf.cdata, x[:self.nq], x[self.nq:-1], casadi.SX.zeros(self.nq))
+        a = casadi.solve(M, u - tau_rnea)
+        #a = cpin.aba(self.conf.cmodel,self.conf.cdata,x[:self.nq],x[self.nq:-1],u)
+
+        x_next = x + self.conf.dt*casadi.vertcat(x[self.nq:-1], a, 1)
+        
+        return x_next, a
+    
+    def simulate_fun_aug_tau_so(self, x, u):
+        ''' Integrate dynamics '''
+        cpin.framesForwardKinematics(self.conf.cmodel, self.conf.cdata,x[:self.nq])
+
+        # ddq = (u - tau_rnea) / M(q) == cpin.aba(self.conf.cmodel,self.conf.cdata,x[:self.nq],x[self.nq:-1],u)
+        M = cpin.crba(self.conf.cmodel, self.conf.cdata, x[:self.nq])
+        tau_rnea = cpin.rnea(self.conf.cmodel, self.conf.cdata, x[:self.nq], x[self.nq:-1], casadi.SX.zeros(self.nq))
+        a = casadi.solve(M, u - tau_rnea)
+        #a = cpin.aba(self.conf.cmodel,self.conf.cdata,x[:self.nq],x[self.nq:-1],u)
+
+        x_next = x + self.conf.dt*casadi.vertcat(x[self.nq:-1], a, 1)
         
         return x_next
     
@@ -649,6 +879,22 @@ class Manipulator_CAMS:
         x_next = self.x_next(x,u)
         
         return x_next, cost
+    
+    def check_ICS_feasible(self, x):
+        ''' Check if ICS is feasible using JAX '''
+        cpin.framesForwardKinematics(self.conf.cmodel, self.conf.cdata,x[:self.nq])
+        x = x[:-1]
+        p_ee = self.p_ee(x)
+        
+        ellipses = casadi.vertcat(
+        ((p_ee[0] - self.conf.XC1) ** 2) / ((self.conf.A1 / 2) ** 2) + ((p_ee[1] - self.conf.YC1) ** 2) / ((self.conf.B1 / 2) ** 2),
+        ((p_ee[0] - self.conf.XC2) ** 2) / ((self.conf.A2 / 2) ** 2) + ((p_ee[1] - self.conf.YC2) ** 2) / ((self.conf.B2 / 2) ** 2),
+        ((p_ee[0] - self.conf.XC3) ** 2) / ((self.conf.A3 / 2) ** 2) + ((p_ee[1] - self.conf.YC3) ** 2) / ((self.conf.B3 / 2) ** 2),
+        )
+
+        feasible_flags = casadi.mmin(ellipses) > 1
+
+        return feasible_flags    
 
 class UR5_CAMS:
     def __init__(self, name, conf):
@@ -740,7 +986,7 @@ class UR5_CAMS:
         ### Control effort term ###
         u_cost = 0
         for i in range(self.nu):
-            u_cost += u[i]**2 + self.conf.w_b*(u[i]/self.conf.u_max[i])**10
+            u_cost += u[i]**2 + self.conf.w_b*(u[i]/self.conf.u_max[i])**8
 
         ### Distence to target term (log valley centered at target) ###
         peak_rew = np.log(np.exp(self.conf.alpha2*-(np.sqrt((p_ee[0]-self.conf.TARGET_STATE[0])**2 +0.1) - np.sqrt(0.1) - 0.1 + np.sqrt((p_ee[1]-self.conf.TARGET_STATE[1])**2 +0.1) - np.sqrt(0.1) - 0.1 + np.sqrt((p_ee[2]-self.conf.TARGET_STATE[2])**2 +0.1) - np.sqrt(0.1) - 0.1)) + 1)/self.conf.alpha2

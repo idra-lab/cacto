@@ -1,7 +1,7 @@
 import os
 import math
 import random
-import gepetto#.corbaserver
+#import gepetto#.corbaserver
 import time
 import subprocess
 import numpy as np

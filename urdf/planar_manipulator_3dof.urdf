@@ -100,9 +100,9 @@
 	<link name="EE">
 	  <visual>
 	    <geometry>
-	      <sphere radius="0.2"/>
+	      <sphere radius="0.1"/> <!-- radius="0.2" -->
 	    </geometry>
-	    <origin rpy="5 0 0" xyz="0 0 0" /> <!-- rpy="5 0 0" -->
+	    <origin rpy="0 0 0" xyz="0 0 0" /> <!-- rpy="5 0 0" -->
 	    <material name="blue"/>
 	  </visual>
 	</link>

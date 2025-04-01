@@ -4,15 +4,16 @@ import numpy as np
 system_id = 'car'
 
 ''' CACTO parameters '''
-EP_UPDATE = 250                                                                                             # Number of episodes before updating critic and actor
-NUPDATES = 260000                                                                                           # Max NNs updates
-UPDATE_LOOPS = np.arange(1000, 38000, 3000)                                                                 # Number of updates of both critic and actor performed every EP_UPDATE episodes                                                                           
-NEPISODES = int(EP_UPDATE*len(UPDATE_LOOPS))                                                                # Max training episodes
+NUPDATES = 200000 - 1                                                                                # Max NNs updates
+UPDATE_LOOPS = np.clip(np.arange(1000, 500000, 3000), 0, 1.5e4) #np.concatenate(([5000], np.clip(np.arange(1000, 500000, 3000), 0, 1.5e4)))                                                                 # Number of updates of both critic and actor performed every EP_UPDATE episodes                                                                           
+EP_UPDATE = 500                                                                                          # Number of episodes before updating critic and actor
+NEPISODES = int(EP_UPDATE*len(UPDATE_LOOPS)) #int(sum(EP_UPDATE)                                                                # Max training episodes
 NLOOPS = len(UPDATE_LOOPS)                                                                                  # Number of algorithm loops
-NSTEPS = 500                                                                                                # Max episode length
+NSTEPS = 200                                                                                                # Max episode length
 CRITIC_LEARNING_RATE = 5e-4                                                                                 # Learning rate for the critic network
+STD_CRITIC_LEARNING_RATE = 2*CRITIC_LEARNING_RATE
 ACTOR_LEARNING_RATE = 1e-3                                                                                  # Learning rate for the policy network
-REPLAY_SIZE = 2**16                                                                                         # Size of the replay buffer
+REPLAY_SIZE = 2**16                                                                                       # Size of the replay buffer
 BATCH_SIZE = 64                                                                                             # Size of the mini-batch 
 
 # Set _steps_TD_N ONLY if MC not used
@@ -108,7 +109,7 @@ obs_param = np.array([XC1, YC1, XC2, YC2, XC3, YC3, A1, B1, A2, B2, A3, B3])    
 w_d = 1e2                                                                                                   # Distance from target weight
 w_u = 1e1                                                                                                    # Control effort weight
 w_peak = 5e5                                                                                                # Target threshold weight
-w_ob = 5e6                                                                                                  # Obstacle weight
+w_ob = 1e6                                                                                                  # Obstacle weight
 w_v = 0                                                                                                     # Velocity weight
 weight = np.array([w_d, w_u, w_peak, w_ob, w_v])                                                            # Weights vector (tmp)
 cost_weights_running  = np.array([w_d, w_peak, 0., w_ob, w_ob, w_ob, w_u])                                  # Running cost weights vector
@@ -129,10 +130,10 @@ x_des = -7.0                                                                    
 y_des = 0.0                                                                                                 # Target y position
 TARGET_STATE = np.array([x_des,y_des])                                                                      # Target position
 
-
+remap_angle=1
 
 ''' Path parameters '''
-test_set = 'set test'                                                                                       # Test id  
+test_set = 'set test - BICS 5'                                                                                       # Test id  
 Config_path = './Results Car/Results {}/Configs/'.format(test_set)                                          # Configuration path
 Fig_path = './Results Car/Results {}/Figures'.format(test_set)                                              # Figure path
 NNs_path = './Results Car/Results {}/NNs'.format(test_set)                                                  # NNs path
@@ -168,7 +169,7 @@ x_min = np.array([-np.inf, -np.inf, -np.inf, -np.inf, -np.inf, 0])              
 x_init_min = np.array([-15, -15, -math.pi, -10, -3, 0])                                                     # State lower bound initial configuration array
 x_max = np.array([np.inf, np.inf, np.inf, np.inf, np.inf, np.inf])                                          # State upper bound vector
 x_init_max = np.array([ 15,  15,  math.pi, 10, 3, (NSTEPS-1)*dt])                                           # State upper bound initial configuration array
-state_norm_arr = np.array([15, 15, math.pi, 10, 3, int(NSTEPS*dt)])                                         # Array used to normalize states
+state_norm_arr = np.array([15, 15, 1, 10, 3, int(NSTEPS*dt)])                                         # Array used to normalize states
 # state: x, y, theta, v, a, t
 
 # initial configurations for plot.rollout()
@@ -191,7 +192,7 @@ jerk_lower_bound = -1
 jerk_upper_bound = 1                                                                                        # Action upper bound
 u_min = np.array([omega_lower_bound, jerk_lower_bound])                                                     # Action lower bound vector
 u_max = np.array([omega_upper_bound, jerk_upper_bound])                                                     # Action upper bound vector
-w_b = 1/w_u
+w_b = 1e2 #1/w_u
 
 
 
@@ -201,3 +202,7 @@ fig_ax_lim = np.array([[-16, 16], [-16, 16]])                                   
 
 
 profile = 0                                                                                                 # Profile flag
+
+
+
+BICS_flag = 1

@@ -1,27 +1,4 @@
-import tensorflow as tf
 import numpy as np
-
-def array2tensor(array):
-    
-    return tf.expand_dims(tf.convert_to_tensor(array), 0)
-
-def de_normalize_tensor(state, state_norm_arr):
-    ''' Retrieve state from normalized state - tensor '''
-    state_time = tf.concat([tf.zeros([state.shape[0], state.shape[1]-1]), tf.reshape((state[:,-1]+1)*state_norm_arr[-1]/2,[state.shape[0],1])],1)
-    state_no_time = state * state_norm_arr
-    mask = tf.concat([tf.ones([state.shape[0], state.shape[1]-1]), tf.zeros([state.shape[0], 1])],1)
-    state_not_norm = state_no_time * mask + state_time * (1 - mask)
-
-    return state_not_norm
-
-def normalize_tensor(state, state_norm_arr):
-    ''' Retrieve state from normalized state - tensor '''
-    state_norm_time = tf.concat([tf.zeros([state.shape[0], state.shape[1]-1]), tf.reshape(((state[:,-1]) / state_norm_arr[-1])*2 - 1,[state.shape[0],1])],1)
-    state_norm_no_time = state / state_norm_arr
-    mask = tf.concat([tf.ones([state.shape[0], state.shape[1]-1]), tf.zeros([state.shape[0], 1])],1)
-    state_norm = state_norm_no_time * mask + state_norm_time * (1 - mask)
-
-    return state_norm
 
 def de_normalize(state, state_norm_arr):
     ''' Retrieve state from normalized state '''
@@ -39,4 +16,32 @@ def normalize(state, state_norm_arr):
 
     return state_norm
 
+import jax
+import jax.numpy as jnp
+import conf_double_integrator as conf
+#import conf_manipulator as conf
+
+def nn_eval(model, params, input):
+    """Compute the output of a NN given an input in JAX."""
+    
+    if conf.NORMALIZE_INPUTS:
+        input = input / conf.state_norm_arr
+
+    if (conf.system_id in {'car', 'car_park'}) and conf.remap_angle:
+        input = jnp.hstack([
+            input[:, 0], input[:, 1], jnp.cos(input[:, 2]), jnp.sin(input[:, 2]),
+            input[:, 3], input[:, 4], input[:, 5]
+        ])
+    elif conf.system_id == 'manipulator' and conf.remap_angle:
+        input = jnp.hstack([
+            jnp.cos(input[0]), jnp.sin(input[0]), jnp.cos(input[1]), jnp.sin(input[1]),
+            jnp.cos(input[2]), jnp.sin(input[2]), input[3], input[4], input[5], input[6]
+        ])
+    elif conf.system_id == 'bicopter' and conf.remap_angle:
+        input = jnp.hstack([
+            input[:, 0], input[:, 1], jnp.cos(input[:, 2]), jnp.sin(input[:, 2]),
+            input[:, 3], input[:, 4], input[:, 5], input[:, 6]
+        ])
+
+    return model.apply(params, input)
 

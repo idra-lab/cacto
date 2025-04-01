@@ -3,15 +3,16 @@ import numpy as np
 system_id = 'single_integrator'
 
 ''' CACTO parameters '''
-EP_UPDATE = 200                                                                                             # Number of episodes before updating critic and actor
-NUPDATES = 100000                                                                                           # Max NNs updates
-UPDATE_LOOPS = np.arange(1000, 25000, 3000)                                                                 # Number of updates of both critic and actor performed every EP_UPDATE episodes                                                                                
-NEPISODES = int(EP_UPDATE*len(UPDATE_LOOPS))                                                                # Max training episodes
+NUPDATES = 25001 - 1                                                                                           # Max NNs updates
+UPDATE_LOOPS = np.clip(np.arange(1000, 500000, 3000), 0, 1.5e4) #np.concatenate(([5000], np.clip(np.arange(1000, 100000, 3000), 0, 1.5e4)))                                                                 # Number of updates of both critic and actor performed every EP_UPDATE episodes                                                                           
+EP_UPDATE = 200 #*np.ones(len(UPDATE_LOOPS))                                                                                             # Number of episodes before updating critic and actor
+NEPISODES = int(EP_UPDATE*len(UPDATE_LOOPS)) #int(sum(EP_UPDATE)                                                                # Max training episodes
 NLOOPS = len(UPDATE_LOOPS)                                                                                  # Number of algorithm loops
 NSTEPS = 100                                                                                                # Max episode length
 CRITIC_LEARNING_RATE = 5e-4                                                                                 # Learning rate for the critic network
+STD_CRITIC_LEARNING_RATE = 2*CRITIC_LEARNING_RATE
 ACTOR_LEARNING_RATE = 1e-3                                                                                  # Learning rate for the policy network
-REPLAY_SIZE = 2**16                                                                                         # Size of the replay buffer
+REPLAY_SIZE = 2**16                                                                                       # Size of the replay buffer
 BATCH_SIZE = 128                                                                                            # Size of the mini-batch 
 
 # Set _steps_TD_N ONLY if MC not used
@@ -131,7 +132,7 @@ TARGET_STATE = np.array([x_des,y_des])                                          
 
 
 ''' Path parameters '''
-test_set = 'set test'                                                                                          # Test id  
+test_set = 'set test - BICS'                                                                                          # Test id  
 Config_path = './Results Single Integrator/Results {}/Configs/'.format(test_set)                            # Configuration path
 Fig_path = './Results Single Integrator/Results {}/Figures'.format(test_set)                                # Figure path
 NNs_path = './Results Single Integrator/Results {}/NNs'.format(test_set)                                    # NNs path
@@ -188,7 +189,7 @@ tau_lower_bound = -6                                                            
 tau_upper_bound = 6                                                                                         # Action upper bound
 u_min = tau_lower_bound*np.ones(nb_action)                                                                  # Action lower bound vector
 u_max = tau_upper_bound*np.ones(nb_action)                                                                  # Action upper bound vector
-w_b = 1/w_u
+w_b = 1e2 #1/w_u
 
 
 
@@ -198,3 +199,7 @@ fig_ax_lim = np.array([[-16, 16], [-16, 16]])                                   
 
 
 profile = 0                                                                                                 # Profile flag
+
+
+
+BICS_flag = 1
