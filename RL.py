@@ -1,7 +1,11 @@
 import uuid
 import math
+import time
+import random
 import numpy as np
 import tensorflow as tf
+import matplotlib.pyplot as plt
+import pinocchio as pin
 
 class RL_AC:
     def __init__(self, env, NN, conf, N_try):
@@ -49,11 +53,6 @@ class RL_AC:
         self.actor_optimizer = None
         self.critic_optimizer = None
 
-        self.init_rand_state = None
-        self.NSTEPS_SH = 0
-        self.control_arr = None
-        self.state_arr = None
-        self.ee_pos_arr = None
         self.exp_counter = np.zeros(conf.REPLAY_SIZE)
 
         return
@@ -68,6 +67,7 @@ class RL_AC:
             self.target_critic = self.NN.create_critic_elu()
         elif self.conf.critic_type == 'sine':
             self.critic_model = self.NN.create_critic_sine()
+            self.std_critic_model = self.NN.create_std_critic_sine()
             self.target_critic = self.NN.create_critic_sine()
         elif self.conf.critic_type == 'sine-elu':
             self.critic_model = self.NN.create_critic_sine_elu()
@@ -77,38 +77,39 @@ class RL_AC:
             self.target_critic = self.NN.create_critic_relu()
 
         # Set optimizer specifying the learning rates
-        if self.conf.LR_SCHEDULE:
-            # Piecewise constant decay schedule
-            self.CRITIC_LR_SCHEDULE = tf.keras.optimizers.schedules.PiecewiseConstantDecay(self.conf.boundaries_schedule_LR_C, self.conf.values_schedule_LR_C) 
-            self.ACTOR_LR_SCHEDULE  = tf.keras.optimizers.schedules.PiecewiseConstantDecay(self.conf.boundaries_schedule_LR_A, self.conf.values_schedule_LR_A)
-            self.critic_optimizer   = tf.keras.optimizers.Adam(self.CRITIC_LR_SCHEDULE)
-            self.actor_optimizer    = tf.keras.optimizers.Adam(self.ACTOR_LR_SCHEDULE)
-        else:
-            self.critic_optimizer   = tf.keras.optimizers.Adam(self.conf.CRITIC_LEARNING_RATE)
-            self.actor_optimizer    = tf.keras.optimizers.Adam(self.conf.ACTOR_LEARNING_RATE)
+        self.critic_optimizer   = tf.keras.optimizers.Adam(self.conf.CRITIC_LEARNING_RATE)
+        self.std_critic_optimizer = tf.keras.optimizers.Adam(self.conf.STD_CRITIC_LEARNING_RATE)
+        self.actor_optimizer    = tf.keras.optimizers.Adam(self.conf.ACTOR_LEARNING_RATE)
 
-        # Set initial weights of the NNs
+         # Set initial weights of the NNs
         if recover_training is not None: 
             NNs_path_rec = str(recover_training[0])
             N_try = recover_training[1]
             update_step_counter = recover_training[2]
             self.actor_model.load_weights("{}/N_try_{}/actor_{}.h5".format(NNs_path_rec,N_try,update_step_counter))
-            self.critic_model.load_weights("{}/N_try_{}/critic_{}.h5".format(NNs_path_rec,N_try,update_step_counter))
-            self.target_critic.load_weights("{}/N_try_{}/target_critic_{}.h5".format(NNs_path_rec,N_try,update_step_counter))
+            #self.critic_model.load_weights("{}/N_try_{}/critic_{}.h5".format(NNs_path_rec,N_try,update_step_counter))
+            #self.target_critic.load_weights("{}/N_try_{}/target_critic_{}.h5".format(NNs_path_rec,N_try,update_step_counter))
         else:
             self.target_critic.set_weights(self.critic_model.get_weights())   
 
-    def update(self, state_batch, state_next_rollout_batch, partial_reward_to_go_batch, dVdx_batch, d_batch, term_batch, weights_batch, batch_size=None):
-        ''' Update both critic and actor '''
+    def update_critic(self, state_batch, state_next_rollout_batch, partial_reward_to_go_batch, dVdx_batch, d_batch, term_batch, weights_batch, batch_size=None):
+        ''' Update critic '''
         # Update the critic backpropagating the gradients
         critic_grad, reward_to_go_batch, critic_value, target_critic_value = self.NN.compute_critic_grad(self.critic_model, self.target_critic, state_batch, state_next_rollout_batch, partial_reward_to_go_batch, dVdx_batch, d_batch, weights_batch)
         self.critic_optimizer.apply_gradients(zip(critic_grad, self.critic_model.trainable_variables))
-
+        return reward_to_go_batch, critic_value, target_critic_value
+        
+    def update_actor(self, state_batch, term_batch, batch_size=None):
+        ''' Update actor '''
         # Update the actor backpropagating the gradients
         actor_grad = self.NN.compute_actor_grad(self.actor_model, self.critic_model, state_batch, term_batch, batch_size)
         self.actor_optimizer.apply_gradients(zip(actor_grad, self.actor_model.trainable_variables))
-
-        return reward_to_go_batch, critic_value, target_critic_value
+    
+    def update_std_critic(self, state_batch, state_next_rollout_batch, partial_reward_to_go_batch, dVdx_batch, d_batch, weights_batch):
+        ''' Update the standard critic '''
+        # Update the critic backpropagating the gradients
+        std_critic_grad = self.NN.compute_std_citic_grad(self.std_critic_model, self.critic_model, self.target_critic, state_batch, state_next_rollout_batch, partial_reward_to_go_batch, dVdx_batch, d_batch, weights_batch)
+        self.std_critic_optimizer.apply_gradients(zip(std_critic_grad, self.std_critic_model.trainable_variables))
     
     @tf.function
     def update_target(self, target_weights, weights):
@@ -117,18 +118,19 @@ class RL_AC:
         for (a, b) in zip(target_weights, weights):
             a.assign(b * tau + a * (1 - tau))
 
-    def learn_and_update(self, update_step_counter, buffer, ep):
+    def learn_and_update(self, update_step_counter, buffer, ep, BICSf, plot_fun=None):
         ''' Sample experience and update buffer priorities and NNs '''
+        # create a copy of the actor network for BICS
+        if BICSf > 0:
+            self.actor_model_copy = self.NN.create_actor()
+            self.actor_model_copy.set_weights(self.actor_model.get_weights())
+
+        # Sample batch of transitions from the buffer
+        state_batch, partial_reward_to_go_batch, state_next_rollout_batch, dVdx_batch, d_batch, term_batch, weights_batch, batch_idxes = buffer.sample(n_sample=int(self.conf.UPDATE_LOOPS[ep]))
         for i in range(int(self.conf.UPDATE_LOOPS[ep])):
-            # Sample batch of transitions from the buffer
-            state_batch, partial_reward_to_go_batch, state_next_rollout_batch, dVdx_batch, d_batch, term_batch, weights_batch, batch_idxes = buffer.sample()
-
-            # Update both critic and actor
-            reward_to_go_batch, critic_value, target_critic_value = self.update(state_batch, state_next_rollout_batch, partial_reward_to_go_batch, dVdx_batch, d_batch, term_batch, weights_batch)
-
-            # Update buffer priorities
-            if self.conf.prioritized_replay_alpha != 0:                                
-                buffer.update_priorities(batch_idxes, reward_to_go_batch, critic_value, target_critic_value)  
+            # Update critic and actor
+            reward_to_go_batch, critic_value, target_critic_value = self.update_critic(state_batch[i], state_next_rollout_batch[i], partial_reward_to_go_batch[i], dVdx_batch[i], d_batch[i], term_batch[i], weights_batch[i])
+            self.update_actor(state_batch[i], term_batch[i])
 
             # Update target critic
             if not self.conf.MC:
@@ -140,94 +142,101 @@ class RL_AC:
             if update_step_counter%self.conf.save_interval == 0:
                 self.RL_save_weights(update_step_counter)
 
+            if update_step_counter > self.conf.NUPDATES:
+                break
+
+        if BICSf > 0:
+            state_batch, partial_reward_to_go_batch, state_next_rollout_batch, dVdx_batch, d_batch, term_batch, weights_batch, batch_idxes = buffer.sample(n_sample=int(self.conf.UPDATE_LOOPS[ep]))
+            for i in range(int(self.conf.UPDATE_LOOPS[ep])):
+                # Update the standard critic
+                self.update_std_critic(state_batch[i], state_next_rollout_batch[i], partial_reward_to_go_batch[i], dVdx_batch[i], d_batch[i], weights_batch[i])
+
+                if update_step_counter > self.conf.NUPDATES:
+                    break
+
         return update_step_counter
     
     def RL_Solve(self, TO_controls, TO_states, TO_step_cost):
         ''' Solve RL problem '''
-        ep_return = 0                                                                 # Initialize the return
-        rwrd_arr = np.empty(self.NSTEPS_SH+1)                                         # Reward array
-        state_next_rollout_arr = np.zeros((self.NSTEPS_SH+1, self.conf.nb_state))     # Next state array
-        partial_reward_to_go_arr = np.empty(self.NSTEPS_SH+1)                         # Partial cost-to-go array
-        total_reward_to_go_arr = np.empty(self.NSTEPS_SH+1)                           # Total cost-to-go array
-        term_arr = np.zeros(self.NSTEPS_SH+1)                                         # Episode-termination flag array
-        term_arr[-1] = 1
-        done_arr = np.zeros(self.NSTEPS_SH+1)                                         # Episode-MC-termination flag array
+        ep_return = 0                                                                  # Initialize the return
+        rwrd_arr = np.zeros_like(TO_step_cost)                                         # Reward array
+        state_arr = np.zeros_like(TO_states)                                           # State array
+        state_next_rollout_arr = np.zeros_like(TO_states)                              # Next state array
+        ee_pos_arr = np.zeros((TO_states.shape[0], 3))                                 # End-effector position array
+        partial_reward_to_go_arr = np.zeros_like(TO_step_cost)                         # Partial cost-to-go array
+        term_arr = np.zeros_like(TO_step_cost)                                         # Episode-termination flag array
+        done_arr = np.zeros_like(TO_step_cost)                                         # Episode-MC-termination flag array
 
         # START RL EPISODE
-        self.control_arr = TO_controls # action clipped in TO
-        
+        NSTEPS_SH = TO_controls.shape[0]
+
         if self.conf.env_RL:
-            for step_counter in range(self.NSTEPS_SH):
+            control_arr = TO_controls
+            for step_counter in range(NSTEPS_SH):
                 # Simulate actions and retrieve next state and compute reward
-                self.state_arr[step_counter+1,:], rwrd_arr[step_counter] = self.env.step(self.conf.cost_weights_running, self.state_arr[step_counter,:], self.control_arr[step_counter,:])
+                state_arr[step_counter+1,:], rwrd_arr[step_counter] = self.env.step(self.conf.cost_weights_running, state_arr[step_counter,:], control_arr[step_counter,:])
 
                 # Compute end-effector position
-                self.ee_pos_arr[step_counter+1,:] = self.env.get_end_effector_position(self.state_arr[step_counter+1, :])
-            rwrd_arr[-1] = self.env.reward(self.conf.cost_weights_terminal, self.state_arr[-1,:])
+                ee_pos_arr[step_counter+1,:] = self.env.get_end_effector_position(state_arr[step_counter+1, :])
+
+            rwrd_arr[-1] = self.env.reward(self.conf.cost_weights_terminal, state_arr[-1,:])
+            term_arr[-1] = 1
         else:
-            self.state_arr, rwrd_arr = TO_states, -TO_step_cost
+            state_arr, rwrd_arr = TO_states, -TO_step_cost
+            term_arr[-1] = 1
 
         ep_return = sum(rwrd_arr)
 
         # Store transition after computing the (partial) cost-to go when using n-step TD (from 0 to Monte Carlo)
-        for i in range(self.NSTEPS_SH+1):
+        for i in range(NSTEPS_SH+1):
             # set final lookahead step depending on whether Monte Cartlo or TD(n) is used
             if self.conf.MC:
-                final_lookahead_step = self.NSTEPS_SH
+                final_lookahead_step = NSTEPS_SH
                 done_arr[i] = 1 
             else:
-                final_lookahead_step = min(i+self.conf.nsteps_TD_N, self.NSTEPS_SH)
-                if final_lookahead_step == self.NSTEPS_SH:
+                final_lookahead_step = min(i+self.conf.nsteps_TD_N, NSTEPS_SH)
+                if final_lookahead_step == NSTEPS_SH:
                     done_arr[i] = 1 
                 else:
-                    state_next_rollout_arr[i,:] = self.state_arr[final_lookahead_step+1,:]
+                    state_next_rollout_arr[i,:] = state_arr[final_lookahead_step+1,:]
             
             # Compute the partial and total cost to go
             partial_reward_to_go_arr[i] = np.float32(sum(rwrd_arr[i:final_lookahead_step+1]))
-            total_reward_to_go_arr[i] = np.float32(sum(rwrd_arr[i:self.NSTEPS_SH+1]))
 
-        return self.state_arr, partial_reward_to_go_arr, total_reward_to_go_arr, state_next_rollout_arr, done_arr, rwrd_arr, term_arr, ep_return, self.ee_pos_arr
+        return state_arr, partial_reward_to_go_arr, state_next_rollout_arr, done_arr, rwrd_arr, term_arr, ep_return, ee_pos_arr
     
     def RL_save_weights(self, update_step_counter='final'):
         ''' Save NN weights '''
         self.actor_model.save_weights(self.conf.NNs_path+"/N_try_{}/actor_{}.h5".format(self.N_try,update_step_counter))
-        self.critic_model.save_weights(self.conf.NNs_path+"/N_try_{}/critic_{}.h5".format(self.N_try,update_step_counter))
-        self.target_critic.save_weights(self.conf.NNs_path+"/N_try_{}/target_critic_{}.h5".format(self.N_try,update_step_counter))
 
-    def create_TO_init(self, ep, ICS):
-        ''' Create initial state and initial controls for TO '''
-        self.init_rand_state = ICS    
-        
-        self.NSTEPS_SH = self.conf.NSTEPS - int(self.init_rand_state[-1]/self.conf.dt)
-        if self.NSTEPS_SH == 0:
+    def create_TO_init(self, TrOp, ep, init_rand_state):
+        ''' Create initial state and initial controls for TO '''        
+        NSTEPS_SH = self.conf.NSTEPS - int(init_rand_state[-1]/self.conf.dt)
+        if NSTEPS_SH == 0:
             return None, None, None, None, 0
 
-        # Initialize array to store RL state, control, and end-effector trajectories
-        self.control_arr = np.empty((self.NSTEPS_SH, self.conf.nb_action))
-        self.state_arr = np.empty((self.NSTEPS_SH+1, self.conf.nb_state))
-        self.ee_pos_arr = np.empty((self.NSTEPS_SH+1,3))
-
-        # Set initial state and end-effector position
-        self.state_arr[0,:] = self.init_rand_state
-        self.ee_pos_arr[0,:] = self.env.get_end_effector_position(self.state_arr[0, :])
-
         # Initialize array to initialize TO state and control variables
-        init_TO_controls = np.zeros((self.NSTEPS_SH, self.conf.nb_action))
-        init_TO_states = np.zeros(( self.NSTEPS_SH+1, self.conf.nb_state))
+        init_TO_controls = np.zeros((NSTEPS_SH, self.conf.nb_action))
+        init_TO_states = np.zeros(( NSTEPS_SH+1, self.conf.nb_state))
 
         # Set initial state 
-        init_TO_states[0,:] = self.init_rand_state
+        init_TO_states[0,:] = init_rand_state
 
         # Simulate actor's actions to compute the state trajectory used to initialize TO state variables (use ICS for state and 0 for control if it is the first episode otherwise use policy rollout)
         success_init_flag = 1
-        for i in range(self.NSTEPS_SH):   
+        for i in range(NSTEPS_SH):   
             if ep == 0:
-                init_TO_controls[i,:] = np.zeros(self.conf.nb_action)
+                init_TO_controls_tau = np.zeros(self.conf.nb_action)
+                init_TO_controls[i,:] = init_TO_controls_tau
             else:
-                init_TO_controls[i,:] = tf.squeeze(self.NN.eval(self.actor_model, np.array([init_TO_states[i,:]]))).numpy()
-            init_TO_states[i+1,:] = self.env.simulate(init_TO_states[i,:],init_TO_controls[i,:])
+                init_TO_controls_tau = tf.squeeze(self.NN.eval(self.actor_model, np.array([init_TO_states[i,:]]))).numpy()
+                try:
+                    init_TO_controls[i,:] = pin.aba(self.conf.robot.model, self.conf.robot.data, np.copy(init_TO_states[i,:self.conf.nq]), np.copy(init_TO_states[i,self.conf.nq:-1]), init_TO_controls_tau)
+                except:
+                    init_TO_controls[i,:] = init_TO_controls_tau
+            init_TO_states[i+1,:] = self.env.simulate(init_TO_states[i,:],init_TO_controls_tau)
             if np.isnan(init_TO_states[i+1,:]).any():
                 success_init_flag = 0
                 return None, None, None, None, success_init_flag
 
-        return self.init_rand_state, init_TO_states, init_TO_controls, self.NSTEPS_SH, success_init_flag
+        return init_rand_state, init_TO_states, init_TO_controls, NSTEPS_SH, success_init_flag

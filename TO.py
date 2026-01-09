@@ -1,8 +1,5 @@
-import sys
-import math
 import casadi
 import numpy as np
-import pinocchio.casadi as cpin
 
 class TO_Casadi:
     
@@ -51,7 +48,8 @@ class TO_Casadi:
         # Roll out loop, summing the integral cost and defining the shooting constraints.
         total_cost = 0
         
-        opti.subject_to(xs[0] == ICS_state[:-1])
+        x0 = opti.parameter(len(ICS_state) - 1)
+        opti.subject_to(xs[0] == x0)
 
         for t in range(T):
             x_next, r_cost = runningModels[t].step_fun(xs[t], us[t])
@@ -71,24 +69,24 @@ class TO_Casadi:
         for u,ug in zip(us,init_u_TO): opti.set_initial(u,ug)
 
         # Set solver options
-        opts = {'ipopt.linear_solver':'ma57', 'ipopt.sb': 'yes','ipopt.print_level': 0, 'print_time': 0} #, 'ipopt.max_iter': 500} 
+        opts = {'ipopt.linear_solver':'ma57', 'ipopt.sb': 'yes','ipopt.print_level': 0, 'print_time': 0} # 'ipopt.max_iter':50
         opti.solver("ipopt", opts) 
         
         try:
+            opti.set_value(x0, ICS_state[:-1])
             opti.solve()
+
             TO_states = np.array([ opti.value(x) for x in xs ])
             TO_controls = np.array([ opti.value(u) for u in us ])
             TO_total_cost = opti.value(total_cost)
-            TO_ee_pos_arr = np.empty((T+1,3))
-            TO_step_cost = np.empty(T+1)
-            for n in range(T):
-                TO_ee_pos_arr[n,:] = np.reshape(runningModels[n].p_ee(TO_states[n,:]),-1)
-                TO_step_cost[n] = runningModels[n].cost(TO_states[n,:], TO_controls[n,:])
-            TO_ee_pos_arr[-1,:] = np.reshape(self.terminalModel.p_ee(TO_states[-1,:]),-1)
-            TO_step_cost[-1] = self.terminalModel.cost(TO_states[-1,:], TO_controls[-1,:])
+            TO_ee_pos_arr = np.array([np.reshape(runningModels[0].p_ee(TO_states[n,:]),-1) for n in range(T+1)])
+            TO_step_cost = np.concatenate((np.array([runningModels[0].cost(TO_states[n,:], TO_controls[n,:]) for n in range(T)]), np.array([self.terminalModel.cost(TO_states[-1,:], TO_controls[-1,:])])))
             success_flag = 1
-        except:
-            print('ERROR in convergence, returning debug values')
+            if abs(TO_total_cost) > 1e3:
+                success_flag = 0
+            
+        except:            
+            print('ERROR in convergence, returning debug values ({})'.format(opti.stats()['return_status']))
             TO_states = np.array([ opti.debug.value(x) for x in xs ])
             TO_controls = np.array([ opti.debug.value(u) for u in us ])
             TO_total_cost = None
@@ -101,6 +99,7 @@ class TO_Casadi:
     def TO_Solve(self, ICS_state, init_TO_states, init_TO_controls, T):
         ''' Retrieve TO problem solution and compute the value function derviative with respect to the state '''
         success_flag, TO_controls, TO_states, TO_ee_pos_arr, _, TO_step_cost = self.TO_System_Solve(ICS_state, init_TO_states, init_TO_controls, T)
+
         if success_flag == 0:
             return None, None, success_flag, None, None, None 
 
@@ -108,7 +107,7 @@ class TO_Casadi:
             # Compute V gradient w.r.t. x (no computation dV/dt)
             dVdx = self.backward_pass(T+1, TO_states, TO_controls) 
         else:
-            dVdx = np.zeros((T+1, self.conf.nb_state))
+            dVdx = np.zeros((T+1, self.conf.nb_state-1))
 
         # Add the last state component (time)
         TO_states = np.concatenate((TO_states, init_TO_states[0,-1] + np.transpose(self.conf.dt*np.array([range(T+1)]))), axis=1)
@@ -154,17 +153,23 @@ class TO_Casadi:
         running_cost_xu = casadi.jacobian(casadi.jacobian(running_cost,x),u)
         terminal_cost_xx, terminal_cost_x = casadi.hessian(terminal_cost,x)
 
-        fun_running_cost_x   = casadi.Function('fun_running_cost_x',  [x],  [running_cost_x], ['x'], ['running_cost_x'])
-        fun_running_cost_xx  = casadi.Function('fun_running_cost_xx', [x],  [running_cost_xx], ['x'], ['running_cost_xx'])
+        fun_running_cost_x   = casadi.Function('fun_running_cost_x',  [x,u],  [running_cost_x], ['x','u'], ['running_cost_x'])
+        fun_running_cost_xx  = casadi.Function('fun_running_cost_xx', [x,u],  [running_cost_xx], ['x','u'], ['running_cost_xx'])
         fun_running_cost_xu  = casadi.Function('fun_running_cost_xu', [x,u],[running_cost_xu], ['x','u'], ['running_cost_xu'])
-        fun_running_cost_u   = casadi.Function('fun_running_cost_u',  [u],  [running_cost_u], ['u'], ['running_cost_u'])
-        fun_running_cost_uu  = casadi.Function('fun_running_cost_uu', [u],  [running_cost_uu], ['u'], ['running_cost_uu'])
+        fun_running_cost_u   = casadi.Function('fun_running_cost_u',  [x,u],  [running_cost_u], ['x','u'], ['running_cost_u'])
+        fun_running_cost_uu  = casadi.Function('fun_running_cost_uu', [x,u],  [running_cost_uu], ['x','u'], ['running_cost_uu'])
         fun_terminal_cost_x  = casadi.Function('fun_terminal_cost_x', [x],  [terminal_cost_x], ['x'], ['terminal_cost_x'])
         fun_terminal_cost_xx = casadi.Function('fun_terminal_cost_xx',[x],  [terminal_cost_xx], ['x'], ['terminal_cost_xx'])
+
+        x_next_x = casadi.jacobian(self.runningSingleModel.x_next(x,u), x)
+        x_next_u = casadi.jacobian(self.runningSingleModel.x_next(x,u), u)
+
+        fun_x_next_x = casadi.Function('fun_x_next_x', [x,u], [x_next_x], ['x','u'], ['x_next_x'])
+        fun_x_next_u = casadi.Function('fun_x_next_u', [x,u], [x_next_u], ['x','u'], ['x_next_u'])
         
         # The Value function is defined by a quadratic function: 0.5 x' V_{xx,i} x + V_{x,i} x
         V_xx = np.zeros((T, n, n))
-        V_x  = np.zeros((T, n+1))
+        V_x  = np.zeros((T, n))
 
         # Dynamics derivatives w.r.t. x and u
         A = np.zeros((T-1, n, n))
@@ -173,20 +178,20 @@ class TO_Casadi:
         # Initialize value function
         l_x[-1,:], l_xx[-1,:,:] = np.reshape(fun_terminal_cost_x(X_bar[-1,:]),n), fun_terminal_cost_xx(X_bar[-1,:])
         V_xx[T-1,:,:] = l_xx[-1,:,:]
-        V_x[T-1,:-1]    = l_x[-1,:]
+        V_x[T-1,:]    = l_x[-1,:]
 
         for i in range(T-2, -1, -1):
             # Compute dynamics Jacobians
-            A[i,:,:], B[i,:,:] = self.env.augmented_derivative(X_bar[i,:], U_bar[i,:])
+            A[i,:,:], B[i,:,:] = fun_x_next_x(X_bar[i,:], U_bar[i,:]), fun_x_next_u(X_bar[i,:], U_bar[i,:]) #self.env.augmented_derivative(X_bar[i,:], U_bar[i,:])
 
             # Compute the gradient of the cost function at X=X_bar
-            l_x[i,:], l_xx[i,:,:] = np.reshape(fun_running_cost_x(X_bar[i,:]),n), fun_running_cost_xx(X_bar[i,:])
-            l_u[i,:],l_uu[i,:,:]  = np.reshape(fun_running_cost_u(U_bar[i,:]),m), fun_running_cost_uu(U_bar[i,:])
+            l_x[i,:], l_xx[i,:,:] = np.reshape(fun_running_cost_x(X_bar[i,:],U_bar[i,:]),n), fun_running_cost_xx(X_bar[i,:],U_bar[i,:])
+            l_u[i,:],l_uu[i,:,:]  = np.reshape(fun_running_cost_u(X_bar[i,:],U_bar[i,:]),m), fun_running_cost_uu(X_bar[i,:],U_bar[i,:])
             l_xu[i,:,:] = fun_running_cost_xu(X_bar[i,:], U_bar[i,:])                                                            
             
             # Compute regularized cost-to-go
-            Q_x[i,:]     = l_x[i,:] + A[i,:,:].T @ V_x[i+1,:-1]
-            Q_u[i,:]     = l_u[i,:] + B[i,:,:].T @ V_x[i+1,:-1]
+            Q_x[i,:]     = l_x[i,:] + A[i,:,:].T @ V_x[i+1,:]
+            Q_u[i,:]     = l_u[i,:] + B[i,:,:].T @ V_x[i+1,:]
             Q_xx[i,:,:]  = l_xx[i,:,:] + A[i,:,:].T @ V_xx[i+1,:,:] @ A[i,:,:]
             Q_uu[i,:,:]  = l_uu[i,:,:] + B[i,:,:].T @ V_xx[i+1,:,:] @ B[i,:,:]
             Q_xu[i,:,:]  = l_xu[i,:,:] + A[i,:,:].T @ V_xx[i+1,:,:] @ B[i,:,:]
@@ -194,8 +199,8 @@ class TO_Casadi:
             Qbar_uu       = Q_uu[i,:,:] + mu*np.identity(m)
             Qbar_uu_pinv  = np.linalg.pinv(Qbar_uu)
 
-            # Compute the derivative of the Value function w.r.t. x                
-            V_x[i,:-1]    = Q_x[i,:]  - Q_xu[i,:,:] @ Qbar_uu_pinv @ Q_u[i,:]
+            # Compute the derivative of the Value function w.r.t. x   
+            V_x[i,:]    = Q_x[i,:]  - Q_xu[i,:,:] @ Qbar_uu_pinv @ Q_u[i,:]
             V_xx[i,:]   = Q_xx[i,:] - Q_xu[i,:,:] @ Qbar_uu_pinv @ Q_xu[i,:,:].T
 
         return V_x

@@ -1,5 +1,4 @@
 import math
-import mpmath
 import random
 import numpy as np
 import tensorflow as tf
@@ -39,10 +38,6 @@ class Env:
         self.nx = conf.nx
         self.nu = conf.na
 
-        # Rename reward parameters
-        self.offset = self.conf.cost_funct_param[0]
-        self.scale = self.conf.cost_funct_param[1]
-
     def reset(self):
         ''' Choose initial state uniformly at random '''
         state = np.zeros(self.conf.nb_state)
@@ -53,6 +48,23 @@ class Env:
         state[-1] = self.conf.dt*round(time/self.conf.dt)
 
         return state
+    
+    def reset_biased(self, n_BICS, factor, NN_inst, RLAC):
+        ''' Choose initial state uniformly at random '''
+        state_tmp = np.zeros((int(n_BICS*factor),self.conf.nb_state))
+        for j in range(int(n_BICS*factor)):
+            state_tmp[j,:] = self.reset()
+
+        state_tmp = np.squeeze(np.array([state_tmp[i,:] for i in range(int(n_BICS*factor)) if self.check_ICS_feasible(state_tmp[i,:])]))
+
+        std_values_C = tf.exp(NN_inst.eval(RLAC.std_critic_model, state_tmp)).numpy()
+
+        sorted_indices = np.argsort((std_values_C).flatten())
+        
+        state = state_tmp[sorted_indices,:]
+        state = state[-n_BICS:,:]
+
+        return state, std_values_C, state_tmp
 
     def check_ICS_feasible(self, state):
         ''' Check if ICS is not feasible '''
@@ -77,21 +89,26 @@ class Env:
 
         return (state_next, reward)
 
-    def simulate(self, state, action):
+    def simulate(self, state, action, dt=None):
         ''' Simulate dynamics '''
+        if dt is None:
+            dt = self.conf.dt
+
         state_next = np.zeros(self.nx+1)
 
         # Simulate control action
-        self.conf.simu.simulate(np.copy(state[:-1]), action, self.conf.dt, 1) ### Explicit Euler ###
+        self.conf.simu.simulate(np.copy(state[:-1]), action, dt, 1) ### Explicit Euler ###
 
         # Return next state
         state_next[:self.nq], state_next[self.nq:self.nx] = np.copy(self.conf.simu.q), np.copy(self.conf.simu.v)
-        state_next[-1] = state[-1] + self.conf.dt
+        state_next[-1] = state[-1] + dt
         
         return state_next
     
-    def derivative(self, state, action):
+    def derivative(self, state, action, dt=None, CT=0):
         ''' Compute the derivative '''
+        if dt is None:
+            dt = self.conf.dt
         # Create robot model in Pinocchio with q_init as initial configuration
         q_init = state[:self.nq]
         v_init = state[self.nq:self.nx]
@@ -101,10 +118,14 @@ class Env:
 
         Fu = np.zeros((self.nx+1, self.nu))
         Fu[self.nv:-1, :] = self.conf.robot.data.Minv
-        Fu[:self.nx, :] *= self.conf.dt
 
         if self.conf.NORMALIZE_INPUTS:
             Fu[:-1] *= (1/self.conf.state_norm_arr[:-1,None])  
+
+        if CT:
+            return Fu
+
+        Fu[:self.nx, :] *= dt
 
         return Fu
     
@@ -117,6 +138,7 @@ class Env:
         Fx = np.zeros((self.conf.nb_state-1,self.conf.nb_state-1))
         Fu = np.zeros((self.conf.nb_state-1,self.conf.nb_action))
 
+        #pin.computeAllTerms(self.conf.robot.model, self.conf.robot.data, q, v)        
         pin.computeABADerivatives(self.conf.robot.model, self.conf.robot.data, q, v, action)
 
         Fx[:self.nv, :self.nv] = 0.0
@@ -131,23 +153,26 @@ class Env:
         
         return Fx, Fu
 
-    def simulate_batch(self, state, action):
+    def simulate_batch(self, state, action, dt=None):
         ''' Simulate dynamics using tensors and compute its gradient w.r.t control. Batch-wise computation '''        
-        state_next = np.array([self.simulate(s, a) for s, a in zip(state, action)])
+        state_next = np.array([self.simulate(s, a, dt=dt) for s, a in zip(state, action)])
 
         return tf.convert_to_tensor(state_next, dtype=tf.float32)
         
-    def derivative_batch(self, state, action):
-        ''' Simulate dynamics using tensors and compute its gradient w.r.t control. Batch-wise computation '''        
-        Fu = np.array([self.derivative(s, a) for s, a in zip(state, action)])
+    def derivative_batch(self, state, action, dt=None, CT=0):
+        ''' Simulate dynamics using tensors and compute its gradient w.r.t control. Batch-wise computation '''       
+        Fu = np.array([self.derivative(s, a, dt=dt, CT=CT) for s, a in zip(state, action)])
 
         return tf.convert_to_tensor(Fu, dtype=tf.float32)
     
-    def get_end_effector_position(self, state, recompute=True):
+    def get_end_effector_position(self, state, end_effector_frame_id=None, recompute=True):
         ''' Compute end-effector position '''
+        if end_effector_frame_id is None:
+            end_effector_frame_id = self.conf.end_effector_frame_id
+
         q = state[:self.nq] 
 
-        RF = self.conf.robot.model.getFrameId(self.conf.end_effector_frame_id) 
+        RF = self.conf.robot.model.getFrameId(end_effector_frame_id) 
 
         H = self.conf.robot.framePlacement(q, RF, recompute)
     
@@ -156,10 +181,8 @@ class Env:
         return p
     
     def bound_control_cost(self, action):
-        u_cost = 0
-        for i in range(self.conf.nb_action):
-            u_cost += action[i]*action[i] + self.conf.w_b*(action[i]/self.conf.u_max[i])**10
-        
+        u_cost = sum(action*action + self.conf.w_b*(action/self.conf.u_max)**8) #np.log(1/(action-self.conf.u_min*10)) + np.log(1/(-action+self.conf.u_max*10))) #+ self.conf.w_b*(action[i]/self.conf.u_max[i])**8
+
         return u_cost
 
 class SingleIntegrator(Env):
@@ -206,15 +229,22 @@ class SingleIntegrator(Env):
         self.nx = conf.nx
         self.nu = conf.na
     
-    def derivative(self, state, action):
+    def derivative(self, state, action, dt=None, CT=0):
         ''' Compute the derivative '''
+        if dt is None:
+            dt = self.conf.dt
         # Dynamics gradient w.r.t control (1st order euler) 
         Fu = np.zeros((self.nx+1, self.nu))
-        Fu[0,0] = self.conf.dt
-        Fu[1,1] = self.conf.dt
+        Fu[0,0] = 1
+        Fu[1,1] = 1
 
         if self.conf.NORMALIZE_INPUTS:
             Fu[:-1] *= (1/self.conf.state_norm_arr[:-1,None])  
+
+        if CT:
+            return Fu
+        
+        Fu[:self.nx, :] *= self.conf.dt
 
         return Fu
     
@@ -232,8 +262,11 @@ class SingleIntegrator(Env):
         
         return Fx, Fu
     
-    def simulate(self, state, action):
+    def simulate(self, state, action, dt=None):
         ''' Simulate dynamics '''
+        if dt is None:
+            dt = self.conf.dt
+            
         state_next = np.zeros(self.nx+1)
 
         state_next[0] = state[0] + self.conf.dt*action[0]
@@ -279,7 +312,7 @@ class SingleIntegrator(Env):
         partial_reward = np.array([self.reward(w, s) for w, s in zip(weights, state)])
 
         # Redefine action-related cost in tensorflow version
-        u_cost = tf.reduce_sum((action**2 + self.conf.w_b*(action/self.conf.u_max)**10),axis=1) 
+        u_cost = tf.reduce_sum((action**2 + self.conf.w_b*(action/self.conf.u_max)**8),axis=1) 
 
         r = self.scale*(- weights[:,6]*u_cost) + tf.convert_to_tensor(partial_reward, dtype=tf.float32)
 
@@ -355,7 +388,7 @@ class DoubleIntegrator(Env):
         partial_reward = np.array([self.reward(w, s) for w, s in zip(weights, state)])
 
         # Redefine action-related cost in tensorflow version
-        u_cost = tf.reduce_sum((action**2 + self.conf.w_b*(action/self.conf.u_max)**10),axis=1) 
+        u_cost = tf.reduce_sum((action**2 + self.conf.w_b*(action/self.conf.u_max)**8),axis=1) 
 
         r = self.scale*(- weights[:,6]*u_cost) + tf.convert_to_tensor(partial_reward, dtype=tf.float32)
 
@@ -405,15 +438,22 @@ class Car(Env):
         self.nx = conf.nx
         self.nu = conf.na
     
-    def derivative(self, state, action):
+    def derivative(self, state, action, dt=None, CT=0):
         ''' Compute the derivative '''
+        if dt is None:
+            dt = self.conf.dt
         # Dynamics gradient w.r.t control (1st order euler) 
         Fu = np.zeros((self.nx+1, self.nu))
-        Fu[2,0] = self.conf.dt
-        Fu[4,1] = self.conf.dt
+        Fu[2,0] = 1
+        Fu[4,1] = 1
 
         if self.conf.NORMALIZE_INPUTS:
             Fu[:-1] *= (1/self.conf.state_norm_arr[:-1,None])  
+
+        if CT:
+            return Fu
+        
+        Fu[:self.nx, :] *= self.conf.dt
 
         return Fu
     
@@ -434,8 +474,11 @@ class Car(Env):
 
         return Fx, Fu
     
-    def simulate(self, state, action):
+    def simulate(self, state, action, dt=None):
         ''' Simulate dynamics '''
+        if dt is None:
+            dt = self.conf.dt
+
         state_next = np.zeros(self.nx+1)
 
         state_next[0] = state[0] + self.conf.dt*state[3]*tf.cos(state[2]) + self.conf.dt**2*state[4]*tf.cos(state[2])/2
@@ -484,173 +527,12 @@ class Car(Env):
         partial_reward = np.array([self.reward(w, s) for w, s in zip(weights, state)])
 
         # Redefine action-related cost in tensorflow version
-        u_cost = tf.reduce_sum((action**2 + self.conf.w_b*(action/self.conf.u_max)**10),axis=1) 
+        u_cost = tf.reduce_sum((action**2 + self.conf.w_b*(action/self.conf.u_max)**8),axis=1) 
         
         r = self.scale*(- weights[:,6]*u_cost) + tf.convert_to_tensor(partial_reward, dtype=tf.float32)
 
         return tf.reshape(r, [r.shape[0], 1])
-    
-class CarPark(Car):
-    '''
-    :param cost_function_parameters :
-    '''
 
-    metadata = {
-        "render_modes": [
-            "human", "rgb_array"
-        ], 
-        "render_fps": 4,
-    }
-
-    def __init__(self, conf):
-    
-        self.conf = conf
-
-        super().__init__(conf)
-
-        # Rename reward parameters
-        self.offset = self.conf.cost_funct_param[0]
-        self.scale = self.conf.cost_funct_param[1]
-
-        self.alpha = self.conf.soft_max_param[0]
-        self.alpha2 = self.conf.soft_max_param[1]
-
-        self.XC1 = self.conf.obs_param[0]
-        self.YC1 = self.conf.obs_param[1]
-        self.XC2 = self.conf.obs_param[2]
-        self.YC2 = self.conf.obs_param[3]
-        self.XC3 = self.conf.obs_param[4]
-        self.YC3 = self.conf.obs_param[5]
-        
-        self.A1 = self.conf.obs_param[6]
-        self.B1 = self.conf.obs_param[7]
-        self.A2 = self.conf.obs_param[8]
-        self.B2 = self.conf.obs_param[9]
-        self.A3 = self.conf.obs_param[10]
-        self.B3 = self.conf.obs_param[11]
-
-        self.TARGET_STATE = self.conf.TARGET_STATE
-
-        self.nx = conf.nx
-        self.nu = conf.na
-
-    def check_ICS_feasible(self, state):
-        ''' Check if ICS is not feasible '''
-        # check if ee is in the obstacles
-        x_ee, y_ee = self.get_end_effector_position(state)[:2]
-        theta_ee = state[2]
-
-        for i in range(len(self.conf.check_points_BF)):
-            check_points_WF_i = np.array([x_ee, y_ee]) + np.array([[math.cos(theta_ee), -math.sin(theta_ee)], [math.sin(theta_ee), math.cos(theta_ee)]]).dot(self.conf.check_points_BF[i,:])
-            obs_1 = self.obs_cost_fun(check_points_WF_i[0],check_points_WF_i[1],self.XC1,self.YC1,self.A1,self.B1)
-            obs_2 = self.obs_cost_fun(check_points_WF_i[0],check_points_WF_i[1],self.XC2,self.YC2,self.A2,self.B2)
-            obs_3 = self.obs_cost_fun(check_points_WF_i[0],check_points_WF_i[1],self.XC3,self.YC3,self.A3,self.B3)
-        
-            feasible_flag = obs_1 < 0.5 and obs_2 < 0.5 and obs_3 < 0.5
-            if feasible_flag == 0:
-                return feasible_flag
-
-        return feasible_flag
-    
-    def derivative(self, state, action):
-        ''' Compute the derivative '''
-        # Dynamics gradient w.r.t control (1st order euler) 
-        Fu = np.zeros((self.nx+1, self.nu))
-        Fu[3,0] = self.conf.dt
-        Fu[4,1] = self.conf.dt/self.conf.tau_delta
-
-        if self.conf.NORMALIZE_INPUTS:
-            Fu[:-1] *= (1/self.conf.state_norm_arr[:-1,None])  
-
-        return Fu
-    
-    def augmented_derivative(self, state, action):
-        ''' Partial derivatives of system dynamics w.r.t. x '''       
-        # Compute Jacobians for discrete time dynamics
-        Fx = np.zeros((self.conf.nb_state-1,self.conf.nb_state-1))
-        Fu = np.zeros((self.conf.nb_state-1,self.conf.nb_action))
-
-        Fx[:self.conf.nb_state-1,:self.conf.nb_state-1] = np.array([[1, 0, -self.conf.dt*state[3]*math.sin(state[2]),  self.conf.dt*math.cos(state[2]), 0], 
-                                                                    [0, 1,  self.conf.dt*state[3]*math.cos(state[2]),  self.conf.dt*math.sin(state[2]), 0], 
-                                                                    [0, 0,  1,                                         self.conf.dt*math.tan(state[4])/self.conf.L_delta, self.conf.dt*state[3]*mpmath.sec(state[4])**2/self.conf.L_delta], 
-                                                                    [0, 0,  0,                                         1, 0], 
-                                                                    [0, 0,  0,                                         0, 1]])
-        
-        Fu[3,0] = self.conf.dt
-        Fu[4,1] = self.conf.dt/self.conf.tau_delta
-        
-        return Fx, Fu
-    
-    def simulate(self, state, action):
-        ''' Simulate dynamics '''
-        state_next = np.zeros(self.nx+1)
-
-        state_next[0] = state[0] + self.conf.dt*state[3]*math.cos(state[2]) 
-        state_next[1] = state[1] + self.conf.dt*state[3]*math.sin(state[2]) 
-        state_next[2] = state[2] + self.conf.dt*state[3]*math.tan(state[4])/self.conf.L_delta
-        state_next[3] = state[3] + self.conf.dt*action[0]
-        state_next[4] = state[4] + self.conf.dt*action[1]/self.conf.tau_delta
-        state_next[5] = state[5] + self.conf.dt
-
-        return state_next
-
-    def get_end_effector_position(self, state, recompute=True):
-        ''' Compute end-effector position '''
-        p = np.zeros(3)
-        p[:2] = state[:2] + np.array([[math.cos(state[2]), -math.sin(state[2])], [math.sin(state[2]), math.cos(state[2])]]).dot(np.array([self.conf.L_delta/2,0]))
-        
-        return p
-    
-    def obs_cost_fun(self,x,y,x_step,y_step,Wx,Wy,fv=1,k=50):
-        k = self.conf.k_db
-            
-        term1 = 4 + 4 * (y - y_step + Wy/2)**2 * k**2
-        term2 = 4 + 4 * (y - y_step - Wy/2)**2 * k**2
-        term3 = 4 + 4 * (x - x_step + Wx/2)**2 * k**2
-        term4 = 4 + 4 * (x - x_step - Wx/2)**2 * k**2
-        obs_cost = (term1)**(-1/2) * fv * (-np.sqrt(term2) / 2 + (y - y_step - Wy/2) * k) * (term3)**(-1/2) * (term2)**(-1/2) * (np.sqrt(term1) / 2 + (y - y_step + Wy/2) * k) * (term4)**(-1/2) * (np.sqrt(term3) / 2 + (x - x_step + Wx/2) * k) * (-np.sqrt(term4) / 2 + (x - x_step - Wx/2) * k)
-
-        return obs_cost
-
-    def reward(self, weights, state, action=None):
-        ''' Compute reward '''
-        # End-effector coordinates
-        x_ee, y_ee = self.get_end_effector_position(state)[:2]
-        theta_ee = state[2]
-
-        obs_cost = 0
-        check_points_WF = np.dot(np.array([[np.cos(theta_ee), -np.sin(theta_ee)], [np.sin(theta_ee), np.cos(theta_ee)]]), self.conf.check_points_BF.T).T + np.array([x_ee, y_ee])
-        obs_cost += np.sum(self.obs_cost_fun(check_points_WF[:, 0], check_points_WF[:, 1], self.XC1, self.YC1, self.A1, self.B1))
-        obs_cost += np.sum(self.obs_cost_fun(check_points_WF[:, 0], check_points_WF[:, 1], self.XC2, self.YC2, self.A2, self.B2))
-        obs_cost += np.sum(self.obs_cost_fun(check_points_WF[:, 0], check_points_WF[:, 1], self.XC3, self.YC3, self.A3, self.B3))
-
-        # Term pushing the agent to stay in the neighborhood of target
-        peak_rew = math.log(math.exp(self.alpha2*-(math.sqrt((x_ee-self.TARGET_STATE[0])**2 + 0.1) - math.sqrt(0.1) - 0.1 + math.sqrt((y_ee-self.TARGET_STATE[1])**2 + 0.1) - math.sqrt(0.1) - 0.1 )) + 1)/self.alpha2
-
-        # Term pensalizing the control effort
-        if action is not None:
-            u_cost = self.bound_control_cost(action)
-        else:
-            u_cost = 0
-
-        dist_cost = (x_ee-self.TARGET_STATE[0])**2 + (y_ee-self.TARGET_STATE[1])**2
-
-
-        r = self.scale*(- weights[0]*dist_cost + weights[1]*peak_rew - weights[2]*state[3]**2 - weights[3]*obs_cost - weights[6]*u_cost + self.offset) 
-
-        return r
-    
-    def reward_batch(self, weights, state, action):
-        ''' Compute reward using tensors. Batch-wise computation '''
-        partial_reward = np.array([self.reward(w, s) for w, s in zip(weights, state)])
-
-        # Redefine action-related cost in tensorflow version
-        u_cost = tf.reduce_sum((action**2 + self.conf.w_b*(action/self.conf.u_max)**10),axis=1) 
-    
-        r = self.scale*(- weights[:,6]*u_cost) + tf.convert_to_tensor(partial_reward, dtype=tf.float32)
-
-        return tf.reshape(r, [r.shape[0], 1])
-    
 class Manipulator(Env):
     '''
     :param cost_function_parameters :
@@ -691,6 +573,12 @@ class Manipulator(Env):
         self.B3 = self.conf.obs_param[11]
 
         self.TARGET_STATE = self.conf.TARGET_STATE
+
+    def bound_control_cost(self, action):
+        u_cost = sum(action*action + self.conf.w_b*(action/self.conf.u_max)**6)
+        #u_cost += sum(action*action + self.conf.w_b*(np.exp(-(action-self.conf.u_min)) + np.exp(-(self.conf.u_max-action)) - 2*np.exp(-(self.conf.u_max))))
+        
+        return u_cost
     
     def reward(self, weights, state, action=None):
         ''' Compute reward '''
@@ -721,95 +609,14 @@ class Manipulator(Env):
         r = self.scale*(- weights[0]*dist_cost + weights[1]*peak_rew - weights[2]*vel_cost - weights[3]*ell1_cost - weights[4]*ell2_cost - weights[5]*ell3_cost - weights[6]*u_cost + self.offset) #- weights[2]*vel_cost 
 
         return r
-    
-    def reward_batch(self, weights, state, action):
-        ''' Compute reward using tensors. Batch-wise computation '''
-        partial_reward = np.array([self.reward(w, s) for w, s in zip(weights, state)])
-
-        # Redefine action-related cost in tensorflow version
-        u_cost = tf.reduce_sum((action**2 + self.conf.w_b*(action/self.conf.u_max)**10),axis=1) 
-    
-        r = self.scale*(- weights[:,6]*u_cost) + tf.convert_to_tensor(partial_reward, dtype=tf.float32)
-
-        return tf.reshape(r, [r.shape[0], 1])
-
-class UR5(Env):
-
-    metadata = {
-        "render_modes": [
-            "human", "rgb_array"
-        ], 
-        "render_fps": 4,
-    }
-
-    def __init__(self, conf):
-
-        self.conf = conf
-
-        super().__init__(conf)
-
-        # Rename reward parameters
-        self.offset = self.conf.cost_funct_param[0]
-        self.scale = self.conf.cost_funct_param[1]
-
-        self.alpha = self.conf.soft_max_param[0]
-        self.alpha2 = self.conf.soft_max_param[1]
-
-        self.XC1 = self.conf.obs_param[0]
-        self.YC1 = self.conf.obs_param[1]
-        self.ZC1 = self.conf.obs_param[2]
-        self.XC2 = self.conf.obs_param[3]
-        self.YC2 = self.conf.obs_param[4]
-        self.ZC2 = self.conf.obs_param[5]
-        self.XC3 = self.conf.obs_param[6]
-        self.YC3 = self.conf.obs_param[7]
-        self.ZC3 = self.conf.obs_param[8]
-        
-        self.A1 = self.conf.obs_param[9]
-        self.B1 = self.conf.obs_param[10]
-        self.C1 = self.conf.obs_param[11]
-        self.A2 = self.conf.obs_param[12]
-        self.B2 = self.conf.obs_param[13]
-        self.C2 = self.conf.obs_param[14]
-        self.A3 = self.conf.obs_param[15]
-        self.B3 = self.conf.obs_param[16]
-        self.C3 = self.conf.obs_param[17]
-
-        self.TARGET_STATE = self.conf.TARGET_STATE
-    
-    def reward(self, weights, state, action=None):
-        ''' Compute reward '''
-        # End-effector coordinates 
-        x_ee, y_ee, z_ee = self.get_end_effector_position(state)
-
-        # Penalties for the ellipses representing the obstacle
-        ell1_cost = math.log(math.exp(self.alpha*-(((x_ee-self.XC1)**2)/((self.A1/2)**2) + ((y_ee-self.YC1)**2)/((self.B1/2)**2) + ((z_ee-self.ZC1)**2)/((self.C1/2)**2) - 1.0)) + 1)/self.alpha
-        ell2_cost = math.log(math.exp(self.alpha*-(((x_ee-self.XC2)**2)/((self.A2/2)**2) + ((y_ee-self.YC2)**2)/((self.B2/2)**2) + ((z_ee-self.ZC2)**2)/((self.C2/2)**2) - 1.0)) + 1)/self.alpha
-        ell3_cost = math.log(math.exp(self.alpha*-(((x_ee-self.XC3)**2)/((self.A3/2)**2) + ((y_ee-self.YC3)**2)/((self.B3/2)**2) + ((z_ee-self.ZC3)**2)/((self.C3/2)**2) - 1.0)) + 1)/self.alpha
-
-        # Term pushing the agent to stay in the neighborhood of target
-        peak_rew = math.log(math.exp(self.alpha2*-(math.sqrt((x_ee-self.TARGET_STATE[0])**2 +0.1) - math.sqrt(0.1) - 0.1 + math.sqrt((y_ee-self.TARGET_STATE[1])**2 +0.1) - math.sqrt(0.1) - 0.1 + math.sqrt((z_ee-self.TARGET_STATE[2])**2 +0.1) - math.sqrt(0.1) - 0.1)) + 1)/self.alpha2
-
-        if action is not None:
-            u_cost = action.dot(action)
-        else:
-            u_cost = 0
-
-        # Term penalizing the FINAL joint velocity
-        vel_cost = state[self.nq:self.nx].dot(state[self.nq:self.nx])
-
-        dist_cost = (x_ee-self.TARGET_STATE[0])**2 + (y_ee-self.TARGET_STATE[1])**2 + (z_ee-self.TARGET_STATE[2])**2
-
-        r = self.scale*(- weights[0]*dist_cost + weights[1]*peak_rew - weights[2]*vel_cost - weights[3]*ell1_cost - weights[4]*ell2_cost - weights[5]*ell3_cost - weights[6]*u_cost + self.offset) 
-        
-        return r
 
     def reward_batch(self, weights, state, action):
         ''' Compute reward using tensors. Batch-wise computation '''
         partial_reward = np.array([self.reward(w, s) for w, s in zip(weights, state)])
 
         # Redefine action-related cost in tensorflow version
-        u_cost = tf.reduce_sum((action**2 + self.conf.w_b*(action/self.conf.u_max)**10),axis=1) 
+        u_cost = tf.reduce_sum((action**2 + self.conf.w_b*(action/self.conf.u_max)**6),axis=1) 
+        #u_cost = tf.reduce_sum(action**2 + self.conf.w_b*(tf.math.exp(-(action-self.conf.u_min)) + tf.math.exp(-(self.conf.u_max-action)) - 2*tf.math.exp(-(self.conf.u_max-0*action))),axis=1) 
     
         r = self.scale*(- weights[:,6]*u_cost) + tf.convert_to_tensor(partial_reward, dtype=tf.float32)
 

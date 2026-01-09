@@ -1,4 +1,5 @@
 import math
+import casadi
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
@@ -8,7 +9,7 @@ from matplotlib.transforms import Affine2D
 import mpl_toolkits.mplot3d.art3d as art3d
 
 class PLOT():
-    def __init__(self, N_try, env, NN, conf):
+    def __init__(self, N_try, env, env_TO, NN, conf):
         '''    
         :input N_try :                          (Test number)
 
@@ -37,10 +38,15 @@ class PLOT():
         self.xlim = conf.fig_ax_lim[0].tolist()
         self.ylim = conf.fig_ax_lim[1].tolist()
 
+        self.ICS = None
+        self.cost_to_go_TO = np.ones(100)
+
         # Set the ticklabel font size globally
         plt.rcParams['xtick.labelsize'] = 22
         plt.rcParams['ytick.labelsize'] = 22
         plt.rcParams.update({'font.size': 20})
+
+        self.p_ee = env_TO('running_model', self.conf).p_ee
 
         return 
 
@@ -59,24 +65,30 @@ class PLOT():
             #rec2.set_facecolor([30/255, 130/255, 76/255, 1])
             #rec3 = FancyBboxPatch((self.conf.XC3-self.conf.A3/2, self.conf.YC3-self.conf.B3/2), self.conf.A3, self.conf.B3,edgecolor='g', boxstyle='round,pad=0.1',alpha=a)
             #rec3.set_facecolor([30/255, 130/255, 76/255, 1])
-        else:
-            obs1 = Ellipse((self.conf.XC1, self.conf.YC1), self.conf.A1, self.conf.B1, 0.0,alpha=a)
-            obs1.set_facecolor([30/255, 130/255, 76/255, 1])
-            obs2 = Ellipse((self.conf.XC2, self.conf.YC2), self.conf.A2, self.conf.B2, 0.0,alpha=a)
-            obs2.set_facecolor([30/255, 130/255, 76/255, 1])
-            obs3 = Ellipse((self.conf.XC3, self.conf.YC3), self.conf.A3, self.conf.B3, 0.0,alpha=a)
-            obs3.set_facecolor([30/255, 130/255, 76/255, 1])
 
-        return [obs1, obs2, obs3]
+            obs_list = [obs1, obs2, obs3]
+        elif self.conf.system_id != 'oneD':
+            obs1 = Ellipse((self.conf.XC1, self.conf.YC1), self.conf.A1, self.conf.B1, alpha=a)
+            obs1.set_facecolor([30/255, 130/255, 76/255, 1])
+            obs2 = Ellipse((self.conf.XC2, self.conf.YC2), self.conf.A2, self.conf.B2, alpha=a)
+            obs2.set_facecolor([30/255, 130/255, 76/255, 1])
+            obs3 = Ellipse((self.conf.XC3, self.conf.YC3), self.conf.A3, self.conf.B3, alpha=a)
+            obs3.set_facecolor([30/255, 130/255, 76/255, 1])
+            obs_list = [obs1, obs2, obs3]
+        else:
+            obs_list = []
+
+        return obs_list
 
     def plot_Reward(self, plot_obs=0):
-        x = np.arange(-15, 15, 0.1)
-        y = np.arange(-10, 10, 0.1)
+        x = np.arange(-30, 30, 0.1)
+        y = np.arange(-15, 15, 0.1)
         theta = np.pi/2
         ICS = np.array([np.array([i,j,0]) for i in x for j in y])
-        state = np.array([self.compute_ICS(np.array([i,j,0]), 'car')[0] for i in x for j in y]) # for k in theta]
-        state[:,2] = theta
-        r = [self.env.reward(self.conf.cost_weights_running, s) for s in state]
+        #state = np.array([self.compute_ICS(np.array([i,j,0]), 'manipulator')[0] for i in x for j in y]) # for k in theta]
+        #state[:,2] = theta
+        r = [self.env.reward(self.conf.cost_weights_running, ics) for ics in ICS]
+        
         mi = min(r)
         ma = max(r)
         norm = colors.Normalize(vmin=mi,vmax=ma)
@@ -97,7 +109,7 @@ class PLOT():
         #    check_points_WF_i = np.array([[math.cos(theta), -math.sin(theta)], [math.sin(theta), math.cos(theta)]]).dot(self.conf.check_points_BF[i,:]) + ICS[0,:2]
         #    ax.scatter(check_points_WF_i[0], check_points_WF_i[1], c='r')
 
-        ax.plot([self.conf.TARGET_STATE[0]],[self.conf.TARGET_STATE[1]],'b*',markersize=5, legend='Goal position') 
+        ax.plot([self.conf.TARGET_STATE[0]],[self.conf.TARGET_STATE[1]],'b*',markersize=5)#, legend='Goal position') 
         ax.set_xlim(self.xlim)
         ax.set_ylim(self.ylim)
         ax.set_aspect('equal', 'box')
@@ -154,6 +166,12 @@ class PLOT():
         
         elif sys_id == 'single_integrator':
             ICS = np.array([p_ee[0], p_ee[1], 0.0])
+
+        elif sys_id == 'oneD':
+            ICS = np.array([p_ee[0], 0.0, 0.0])
+
+        elif sys_id == 'bicopter':
+            ICS = np.array([p_ee[0], p_ee[1], 0.0, 0.0, 0.0, 0.0, 0.0])
         
         return ICS, continue_flag
 
@@ -328,6 +346,7 @@ class PLOT():
 
         fig.tight_layout()
         #plt.show()
+        plt.close()
 
     def plot_Return(self, ep_reward_list):
         ''' Plot returns (not so meaningful given that the initial state, so also the time horizon, of each episode is randomized) '''
@@ -345,32 +364,85 @@ class PLOT():
     def plot_Critic_Value_function(self, critic_model, n_update, sys_id, name='V'):
         ''' Plot Value function as learned by the critic '''
         if sys_id == 'manipulator':
-            N_discretization_x = 60 + 1  
-            N_discretization_y = 60 + 1
+            N_discretization_x = 120 + 1  
+            N_discretization_y = 120 + 1
 
+            if self.ICS is None:
+                self.ICS = np.array([self.env.reset() for _ in range(N_discretization_y*N_discretization_x)])
+                self.ICS[:,-1] = 0
+
+                self.plot_data = np.zeros(N_discretization_y*N_discretization_x)
+
+            #plot_data = np.zeros((N_discretization_y,N_discretization_x))*np.nan
             plot_data = np.zeros(N_discretization_y*N_discretization_x)*np.nan
             ee_pos = np.zeros((N_discretization_y*N_discretization_x,3))*np.nan
+            #ee_x = np.linspace(-30, 30, N_discretization_x)
+            #ee_y = np.linspace(-35, 25, N_discretization_y)
 
             for k_x in range(N_discretization_x):
                 for k_y in range(N_discretization_y):
-                    ICS = self.env.reset()
-                    ICS[-1] = 0
-                    ee_pos[k_x*(N_discretization_y)+k_y,:] = self.env.get_end_effector_position(ICS)
-                    plot_data[k_x*(N_discretization_y)+k_y] = self.NN.eval(critic_model, np.array([ICS]))
+                    #ee = np.array([ee_x[k_x], ee_y[k_y], 0])
+                    #opti = casadi.Opti()
+                    #state = opti.variable(self.conf.nb_state-1-self.conf.nv)
+                    #total_cost = casadi.sumsqr(ee-self.p_ee(state)) + 1e-4*casadi.sumsqr(state)
+                    #for i in range(self.conf.nq):   
+                    #    opti.subject_to(opti.bounded(self.conf.x_init_min[i], state[i], self.conf.x_init_max[i]))
+                    #opti.minimize(total_cost) 
+                    #opti.set_initial(state, self.conf.q_init)
+                    #opts = {'ipopt.linear_solver':'ma57', 'ipopt.sb': 'yes', 'ipopt.print_level': 0, 'print_time': 0, 'show_eval_warnings': False, 'ipopt.max_iter': 500, 
+                    #        'ipopt.tol': 1e-3, 'ipopt.acceptable_tol': 1e-2, 'ipopt.acceptable_iter': 5, 'ipopt.hessian_approximation': 'limited-memory'}
+                    #opti.solver("ipopt", opts)
 
+                    #try:
+                    #    opti.solve()
+                    #    state = opti.value(state) 
+                    #    ICS = np.concatenate((state, np.zeros(self.conf.nv+1)))
+                    #except:
+                    #    state = np.zeros(self.conf.nq+self.conf.nv+1)
+                    #    print('Optimization failed')
+                    #ICS = self.env.reset()
+                    #ICS[-1] = 0
+                    ICS = self.ICS[k_x*(N_discretization_y)+k_y]
+                    ee_pos[k_x*(N_discretization_y)+k_y,:] = self.env.get_end_effector_position(ICS)
+                    plot_data[k_x*(N_discretization_y)+k_y] = self.NN.eval(critic_model, np.array([ICS]))[0][0]
+                    #plot_data[k_x,k_y] = self.NN.eval(critic_model, np.array([ICS]))
+            #ee_pos = ee_pos.reshape(N_discretization_x,N_discretization_y,3)
             fig = plt.figure(figsize=(8,8))
             ax = fig.add_subplot()
-            plt.scatter(ee_pos[:,0], ee_pos[:,1], c=plot_data, cmap=cm.coolwarm, antialiased=False)
+            #plt.scatter(ee_pos[:,0], ee_pos[:,1], c=plot_data, cmap=cm.coolwarm, antialiased=False)
+            finite_mask = np.isfinite(plot_data)
+            plot_data = np.where(finite_mask, plot_data, 0)
+
+            plt.tricontourf(ee_pos[:, 0], ee_pos[:, 1], plot_data, cmap=cm.coolwarm)
+            #plt.contourf(ee_pos[:,:,0], ee_pos[:,:,1], plot_data.T, cmap=cm.coolwarm, antialiased=False)
             obs_plot_list = self.plot_obstaces(a=0.5)
             for i in range(len(obs_plot_list)):
                 ax.add_patch(obs_plot_list[i])
             plt.colorbar()
+            #contour = ax.contourf(ee_pos[:,0], ee_pos[:,1], plot_data, levels=50, cmap='coolwarm', alpha=0.5)
+            #plt.colorbar(contour)
             plt.title('N_try {} - n_update {}'.format(self.N_try, n_update))
             ax.set_xlim(self.xlim)
             ax.set_ylim(self.ylim)
             ax.set_aspect('equal', 'box')
             plt.savefig('{}/N_try_{}/{}_{}'.format(self.conf.Fig_path,self.N_try,name,int(n_update)))
             plt.close()
+
+            #fig = plt.figure(figsize=(8,8))
+            #ax = fig.add_subplot()
+            #plt.tricontourf(ee_pos[:, 0], ee_pos[:, 1], plot_data- self.plot_data, cmap=cm.coolwarm)
+            #obs_plot_list = self.plot_obstaces(a=0.5)
+            #for i in range(len(obs_plot_list)):
+            #    ax.add_patch(obs_plot_list[i])
+            #plt.colorbar()
+            #plt.title('N_try {} - n_update {}'.format(self.N_try, n_update))
+            #ax.set_xlim(self.xlim)
+            #ax.set_ylim(self.ylim)
+            #ax.set_aspect('equal', 'box')
+            #plt.savefig('{}/N_try_{}/{}diff_{}'.format(self.conf.Fig_path,self.N_try,name,int(n_update)))
+            #plt.close()
+
+            #self.plot_data = plot_data
 
         else:
             N_discretization_x = 30 + 1  
@@ -391,7 +463,7 @@ class PLOT():
 
             fig = plt.figure(figsize=(8,8))
             ax = fig.add_subplot()
-            plt.contourf(ee_x, ee_y, plot_data.T, cmap=cm.coolwarm, antialiased=False)
+            plt.contourf(ee_x, ee_y, plot_data.T, cmap=cm.coolwarm, antialiased=False, levels=50)   
 
             obs_plot_list = self.plot_obstaces(a=0.5)
             for i in range(len(obs_plot_list)):
@@ -406,15 +478,15 @@ class PLOT():
 
     def plot_Critic_Value_function_from_sample(self, n_update, NSTEPS_SH, state_arr, reward_arr):
         # Store transition after computing the (partial) cost-to go when using n-step TD (from 0 to Monte Carlo)
-        reward_to_go_arr = np.zeros(sum(NSTEPS_SH)+len(NSTEPS_SH)*1)
-        idx = 0
-        for n in range(len(NSTEPS_SH)):
-            for i in range(NSTEPS_SH[n]+1):
-                # Compute the partial cost to go
-                reward_to_go_arr[idx] = sum(reward_arr[n][i:])
-                idx += 1
+        reward_to_go_arr = reward_arr #np.zeros(sum(NSTEPS_SH)+len(NSTEPS_SH)*1)
+        #idx = 0
+        #for n in range(len(NSTEPS_SH)):
+        #    for i in range(NSTEPS_SH[n]+1):
+        #        # Compute the partial cost to go
+        #        reward_to_go_arr[idx] = sum(reward_arr[n][i:])
+        #        idx += 1
 
-        state_arr = np.concatenate(state_arr, axis=0)
+        #state_arr = np.concatenate(state_arr, axis=0)
         ee_pos_arr = np.zeros((len(state_arr),3))
         for i in range(state_arr.shape[0]):
             ee_pos_arr[i,:] = self.env.get_end_effector_position(state_arr[i])
@@ -441,20 +513,6 @@ class PLOT():
         ax.set_aspect('equal', 'box')
         plt.savefig('{}/N_try_{}/V_sample_{}'.format(self.conf.Fig_path,self.N_try,int(n_update)))
         plt.close()
-
-    def plot_ICS(self,state_arr):
-        fig = plt.figure(figsize=(12,8))
-        ax = fig.add_subplot()
-        for j in range(len(state_arr)):
-            ax.scatter(state_arr[j][0,0],state_arr[j][0,1])
-            obs_plot_list = plot_fun.plot_obstaces()
-            for i in range(len(obs_plot_list)):
-                ax.add_artist(obs_plot_list[i]) 
-        ax.set_xlim(self.fig_ax_lim[0].tolist())
-        ax.set_ylim(self.fig_ax_lim[1].tolist())
-        ax.set_aspect('equal', 'box')
-        plt.savefig('{}/N_try_{}/ICS_{}_S{}'.format(conf.Fig_path,N_try,update_step_counter,int(w_S)))
-        plt.close(fig)
 
     def plot_rollout_and_traj_from_ICS(self, init_state, n_update, actor_model, TrOp, tag, steps=200):
         ''' Plot results from TO and episode to check consistency '''
@@ -507,7 +565,7 @@ class PLOT():
 
         plt.savefig('{}/N_try_{}/ee_traj_{}_{}'.format(self.conf.Fig_path,self.N_try,int(n_update), tag))
 
-    def plot_ICS(self, input_arr, cs=0):
+    def plot_ICS(self, input_arr, input_arr_all=None, cs=0, name='ICS'):
         if cs == 1:
             p_arr = np.zeros((len(input_arr),3))
             fig = plt.figure(figsize=(12,8))
@@ -522,16 +580,22 @@ class PLOT():
             ax.set_ylim(self.conf.fig_ax_lim[1].tolist())
             ax.set_aspect('equal', 'box')
             ax.grid()
-            plt.savefig('{}/N_try_{}/ICS'.format(self.conf.Fig_path,self.N_try))
+            plt.savefig('{}/N_try_{}/{}'.format(self.conf.Fig_path,self.N_try, name))
             plt.close(fig)
         else:    
             p_arr = np.zeros((len(input_arr),3))
             fig = plt.figure(figsize=(12,8))
             ax = fig.add_subplot()
-
+            if input_arr_all is not None:
+                p_arr_tmp = np.zeros((len(input_arr_all),3))
+                for j in range(len(input_arr_all)):
+                    p_arr_tmp[j,:] = self.env.get_end_effector_position(input_arr_all[j])
+                ax.scatter(p_arr_tmp[:,0],p_arr_tmp[:,1],color=plt.rcParams['axes.prop_cycle'].by_key()['color'][0], label='Candidate')
             for j in range(len(input_arr)):
                 p_arr[j,:] = self.env.get_end_effector_position(input_arr[j])
-            ax.scatter(p_arr[:,0],p_arr[:,1])
+            ax.scatter(p_arr[:,0],p_arr[:,1],color=plt.rcParams['axes.prop_cycle'].by_key()['color'][0])
+            ax.scatter(p_arr[:,0],p_arr[:,1], marker='x',color=plt.rcParams['axes.prop_cycle'].by_key()['color'][1], label='Selected')
+            
             obs_plot_list = self.plot_obstaces(a = 0.5)
             for i in range(len(obs_plot_list)):
                 ax.add_artist(obs_plot_list[i]) 
@@ -539,11 +603,13 @@ class PLOT():
             ax.set_ylim(self.conf.fig_ax_lim[1].tolist())
             ax.set_aspect('equal', 'box')
             ax.grid()
-            plt.savefig('{}/N_try_{}/ICS'.format(self.conf.Fig_path,self.N_try))
+            plt.legend()
+            plt.savefig('{}/N_try_{}/{}'.format(self.conf.Fig_path,self.N_try,name))
             plt.close(fig)
 
-    def plot_traj_from_ICS(self, init_state, TrOp, RLAC, update_step_counter=0,ep=0,steps=200, init=0,continue_flag=1):
+    def plot_traj_from_ICS(self, init_state, TrOp, RLAC, update_step_counter=0,ep=0,steps=200, init=0,continue_flag=1, NN_inst=None, ICS=None):
         ''' Plot results from TO and episode to check consistency '''
+        system_id = self.conf.system_id
         colors = cm.coolwarm(np.linspace(0.1,1,len(init_state)))
 
         fig = plt.figure(figsize=(12,8))
@@ -557,13 +623,15 @@ class PLOT():
             
             if init == 0:
                 # zeros
-                _, init_TO_states, init_TO_controls, _, success_init_flag = RLAC.create_TO_init(0, init_state[j,:])
+                _, init_TO_states, init_TO_controls, _, success_init_flag = RLAC.create_TO_init(TrOp, 0, init_state[j,:])
             elif init == 1:
                 # NN
-                _, init_TO_states, init_TO_controls, _, success_init_flag = RLAC.create_TO_init(1, init_state[j,:])
+                _, init_TO_states, init_TO_controls, _, success_init_flag = RLAC.create_TO_init(TrOp, 1, init_state[j,:])
 
             if success_init_flag:
-                _, _, TO_states, _, _, _  = TrOp.TO_System_Solve(init_state[j,:], init_TO_states, init_TO_controls, steps-1)
+                success_TO_flag, TO_controls, TO_states, _, _, _  = TrOp.TO_System_Solve(init_state[j,:], init_TO_states, init_TO_controls, steps-1)
+                if success_TO_flag == 0:
+                    continue
             else:
                 continue
 
@@ -572,24 +640,88 @@ class PLOT():
                     ee_pos_RL[i,:] = self.env.get_end_effector_position(init_TO_states[i,:])
                     ee_pos_TO[i,:] = self.env.get_end_effector_position(TO_states[i,:])
             except:
-                ee_pos_RL[i,:] = self.env.get_end_effector_position(init_TO_states[0,:])
-                ee_pos_TO[i,:] = self.env.get_end_effector_position(TO_states[0,:])
+                ee_pos_RL[i,:] = self.env.get_end_effector_position(init_state[j,:])
+                ee_pos_TO[i,:] = self.env.get_end_effector_position(init_state[j,:])
+            
+            if system_id == 'oneD':
+                ee_pos_RL[:,1] = j/2 - 2.5
+                ee_pos_TO[:,1] = j/2 - 2.5
+            if system_id == 'bicopter':
+                for n in range(len(TO_states)):
+                    if n % 5 != 0:
+                        continue
+                    # Use the n-th state angle
+                    angle = init_TO_states[n,2]  # Angle of the line (assumed in radians)
+                    center = ee_pos_RL[n, :2]  # Center at the corresponding end-effector position
 
-            ax1.plot([self.conf.TARGET_STATE[0]],[self.conf.TARGET_STATE[1]],'b*',markersize=5) 
+                    # Compute the endpoints of the line
+                    dx = (5 / 2) * np.cos(angle)
+                    dy = (5 / 2) * np.sin(angle)
+
+                    start_point = center - np.array([dx, dy])
+                    end_point = center + np.array([dx, dy])
+
+                    # Plot the inclined line on ax1
+                    ax1.plot([start_point[0], end_point[0]], [start_point[1], end_point[1]], color=colors[j], linewidth=1.5)
+
+                    dx = -(2.5 / 2) * np.sin(angle)
+                    dy = (2.5 / 2) * np.cos(angle)
+                    upward_start = center #- np.array([dx, dy])
+                    upward_end = center + np.array([dx, dy])
+
+                    # Plot the upward line
+                    ax1.plot([upward_start[0], upward_end[0]], [upward_start[1], upward_end[1]], color="black", linestyle="--", linewidth=1.0)
+
             ax1.scatter(ee_pos_RL[0,0],ee_pos_RL[0,1],color=colors[j])
             ax1.plot(ee_pos_RL[1:,0],ee_pos_RL[1:,1],'--',color=colors[j])
-                
-            ax2.plot([self.conf.TARGET_STATE[0]],[self.conf.TARGET_STATE[1]],'b*',markersize=5) 
             ax2.scatter(ee_pos_TO[0,0],ee_pos_TO[0,1],color=colors[j])
             ax2.plot(ee_pos_TO[1:,0],ee_pos_TO[1:,1],color=colors[j])
+            
+        if system_id != 'oneD':
+            ax1.plot([self.conf.TARGET_STATE[0]],[self.conf.TARGET_STATE[1]],'b*',markersize=5) 
+            ax2.plot([self.conf.TARGET_STATE[0]],[self.conf.TARGET_STATE[1]],'b*',markersize=5) 
         
-        obs_plot_list = self.plot_obstaces(a=0.5)
-        for i in range(len(obs_plot_list)):
-            ax1.add_patch(obs_plot_list[i])
+            obs_plot_list = self.plot_obstaces(a=0.5)
+            for i in range(len(obs_plot_list)):
+                ax1.add_patch(obs_plot_list[i])
 
-        obs_plot_list = self.plot_obstaces(a=0.5)
-        for i in range(len(obs_plot_list)):
-            ax2.add_patch(obs_plot_list[i])
+            obs_plot_list = self.plot_obstaces(a=0.5)
+            for i in range(len(obs_plot_list)):
+                ax2.add_patch(obs_plot_list[i])
+        else:
+            x_space = np.linspace(-2,2,100)
+            cost_fun = np.array([-self.env.reward(self.conf.cost_weights_running,[x_space_i,0]) for x_space_i in x_space])
+            cost_to_go_fun = np.array([-np.squeeze(NN_inst.eval(RLAC.critic_model,np.array([[x_space_i,0]])).numpy()) for x_space_i in x_space])
+            std_cost_to_go_fun = np.array([-np.squeeze(NN_inst.eval(RLAC.std_critic_model,np.array([[x_space_i,0]])).numpy()) for x_space_i in x_space])
+
+            cost_to_go_TO = np.zeros(len(x_space))
+            for i in range(len(x_space)):        
+                if init == 0:
+                    # zeros
+                    _, init_TO_states, init_TO_controls, _, success_init_flag = RLAC.create_TO_init(0, np.array([x_space[i],0]))
+                elif init == 1:
+                    # NN
+                    _, init_TO_states, init_TO_controls, _, success_init_flag = RLAC.create_TO_init(1, np.array([x_space[i],0]))
+
+                if success_init_flag:
+                    _, _, TO_states, _, cost_to_go_TO[i], _  = TrOp.TO_System_Solve(np.array([x_space[i],0]), init_TO_states, init_TO_controls, steps-1)
+                else:
+                    continue
+            
+            ax1.plot(x_space,cost_fun,color=colors[j], label='Cost')
+            ax1.plot(x_space,cost_to_go_fun/max(abs(self.cost_to_go_TO)),color='g', label='Cost-to-go')
+            ax2.plot(x_space,cost_fun,color=colors[j], label='Cost')
+            ax2.plot(x_space,cost_to_go_fun/max(abs(cost_to_go_fun)),color='g', label='Cost-to-go')
+            ax2.fill_between(x_space,cost_to_go_fun/max(abs(cost_to_go_fun))-std_cost_to_go_fun/max(abs(cost_to_go_fun)),cost_to_go_fun/max(abs(cost_to_go_fun))+std_cost_to_go_fun/max(abs(cost_to_go_fun)),color='g', alpha=0.2)
+            ax1.scatter(x_space,self.cost_to_go_TO/max(abs(self.cost_to_go_TO)),marker='x', c='g', s=10,label='Cost-to-go TO')
+            ax2.scatter(x_space,self.cost_to_go_TO/max(abs(self.cost_to_go_TO)),marker='x',c='g', s=10,label='Cost-to-go TO')
+            if ICS is not None:
+                ICS = np.squeeze(np.array(ICS))
+                ax2.scatter(ICS[:,0],0*ICS[:,0],marker='x',c='r', s=10,label='ICS')
+            ax1.legend()
+            ax2.legend()
+            
+            self.cost_to_go_TO = cost_to_go_TO
 
         ax1.set_xlim(self.xlim)
         ax1.set_ylim(self.ylim)
@@ -609,9 +741,8 @@ class PLOT():
         ax2.grid(True)
 
         plt.savefig('{}/N_try_{}/ee_traj_{}_{}'.format(self.conf.Fig_path,self.N_try,init,update_step_counter))
+        print('ICS plot saved')
 
-
-        
 
 if __name__ == '__main__':
     import os
@@ -636,7 +767,7 @@ if __name__ == '__main__':
     tf.random.set_seed(seed)  # Set tensorflow seed
     random.seed(seed)         # Set random seed
 
-    system_id = 'car_park'
+    system_id = 'manipulator'
 
     TO_method = 'casadi'
 
@@ -654,18 +785,19 @@ if __name__ == '__main__':
 
     # Import configuration file and environment file
     system_map = {
-        'single_integrator': ('conf_single_integrator', 'SingleIntegrator'),
-        'double_integrator': ('conf_double_integrator', 'DoubleIntegrator'),
-        'car':               ('conf_car', 'Car'),
-        'car_park':          ('conf_car_park', 'CarPark'),
-        'manipulator':       ('conf_manipulator', 'Manipulator'),
-        'ur5':               ('conf_ur5', 'UR5')
+        'oneD': ('conf_oneD', 'OneD', 'OneD_CAMS'),
+        'single_integrator': ('conf_single_integrator', 'SingleIntegrator', 'SingleIntegrator_CAMS'),
+        'double_integrator': ('conf_double_integrator', 'DoubleIntegrator', 'DoubleIntegrator_CAMS'),
+        'car':               ('conf_car', 'Car', 'Car_CAMS'),
+        'car_park':          ('conf_car_park', 'CarPark', 'CarPark_CAMS'),
+        'manipulator':       ('conf_manipulator', 'Manipulator', 'Manipulator_CAMS'),
+        'ur5':               ('conf_ur5', 'UR5', 'UR5_CAMS')
     }
-
     try:
-        conf_module, env_class = system_map[system_id]
+        conf_module, env_class, env_TO_class = system_map[system_id]
         conf = importlib.import_module(conf_module)
         Environment = getattr(importlib.import_module('environment'), env_class)
+        Environment_TO = getattr(importlib.import_module('environment_TO'), env_TO_class)
     except KeyError:
         print('System {} not found'.format(system_id))
         sys.exit()
@@ -688,6 +820,7 @@ if __name__ == '__main__':
 
     # Create environment instances
     env = Environment(conf)
+    env_TO = Environment_TO
 
     # Create NN instance
     NN_inst = NN(env, conf, w_S)
@@ -709,6 +842,6 @@ if __name__ == '__main__':
         RLAC.setup_model()
 
     # Create PLOT instance
-    plot_fun = PLOT(N_try, env, NN_inst, conf)
+    plot_fun = PLOT(N_try, env, env_TO, NN_inst, conf)
 
     plot_fun.plot_Reward()

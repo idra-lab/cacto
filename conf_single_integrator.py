@@ -3,13 +3,14 @@ import numpy as np
 system_id = 'single_integrator'
 
 ''' CACTO parameters '''
+NUPDATES = 25001                                                                                            # Max NNs updates
+UPDATE_LOOPS = np.clip(np.arange(1000, 500000, 3000), 0, 1.5e4)                                             # Number of updates of both critic and actor performed every EP_UPDATE episodes                                                                           
 EP_UPDATE = 200                                                                                             # Number of episodes before updating critic and actor
-NUPDATES = 100000                                                                                           # Max NNs updates
-UPDATE_LOOPS = np.arange(1000, 25000, 3000)                                                                 # Number of updates of both critic and actor performed every EP_UPDATE episodes                                                                                
 NEPISODES = int(EP_UPDATE*len(UPDATE_LOOPS))                                                                # Max training episodes
 NLOOPS = len(UPDATE_LOOPS)                                                                                  # Number of algorithm loops
 NSTEPS = 100                                                                                                # Max episode length
 CRITIC_LEARNING_RATE = 5e-4                                                                                 # Learning rate for the critic network
+STD_CRITIC_LEARNING_RATE = 2*CRITIC_LEARNING_RATE
 ACTOR_LEARNING_RATE = 1e-3                                                                                  # Learning rate for the policy network
 REPLAY_SIZE = 2**16                                                                                         # Size of the replay buffer
 BATCH_SIZE = 128                                                                                            # Size of the mini-batch 
@@ -28,44 +29,13 @@ if save_flag:
 else:
     save_interval = np.inf                                                                                  # Save NNs interval
 
-plot_flag = 1
-if plot_flag:
-    plot_rollout_interval = 400                                                                             # plot.rollout() interval (# update)
-    plot_rollout_interval_diff_loc = 6000                                                                   # plot.rollout() interval - diff_loc (# update)
-else:
-    plot_rollout_interval = np.inf                                                                          # plot.rollout() interval (# update)
-    plot_rollout_interval_diff_loc = np.inf                                                                 # plot.rollout() interval - diff_loc (# update)
-
 
 
 ### NNs parameters
 critic_type = 'sine'                                                                                        # Activation function - critic (either relu, elu, sine, sine-elu)
 
-NH1 = 256                                                                                                   # 1st hidden layer size - actor
-NH2 = 256                                                                                                   # 2nd hidden layer size - actor
-
-LR_SCHEDULE = 0                                                                                             # Flag to use a scheduler for the learning rates
-boundaries_schedule_LR_C = [200*REPLAY_SIZE/BATCH_SIZE, 
-                            300*REPLAY_SIZE/BATCH_SIZE,
-                            400*REPLAY_SIZE/BATCH_SIZE,
-                            500*REPLAY_SIZE/BATCH_SIZE]     
-# Values of critic LR                            
-values_schedule_LR_C = [CRITIC_LEARNING_RATE,
-                        CRITIC_LEARNING_RATE/2,
-                        CRITIC_LEARNING_RATE/4,
-                        CRITIC_LEARNING_RATE/8,
-                        CRITIC_LEARNING_RATE/16]  
-# Numbers of critic updates after which the actor LR is changed (based on values_schedule_LR_A)
-boundaries_schedule_LR_A = [200*REPLAY_SIZE/BATCH_SIZE,
-                            300*REPLAY_SIZE/BATCH_SIZE,
-                            400*REPLAY_SIZE/BATCH_SIZE,
-                            500*REPLAY_SIZE/BATCH_SIZE]   
-# Values of actor LR                            
-values_schedule_LR_A = [ACTOR_LEARNING_RATE,
-                        ACTOR_LEARNING_RATE/2,
-                        ACTOR_LEARNING_RATE/4,
-                        ACTOR_LEARNING_RATE/8,
-                        ACTOR_LEARNING_RATE/16]  
+NH1 = 256                                                                                                   # 1st actor hidden layer size - actor
+NH2 = 256                                                                                                   # 2nd actor hidden layer size - actor
 
 NORMALIZE_INPUTS = 1                                                                                        # Flag to normalize inputs (state)
 
@@ -73,17 +43,8 @@ kreg_l1_A = 1e-2                                                                
 kreg_l2_A = 1e-2                                                                                            # Weight of L2 regularization in actor's network - kernel
 breg_l1_A = 1e-2                                                                                            # Weight of L2 regularization in actor's network - bias
 breg_l2_A = 1e-2                                                                                            # Weight of L2 regularization in actor's network - bias
-kreg_l1_C = 1e-2                                                                                            # Weight of L1 regularization in critic's network - kernel
-kreg_l2_C = 1e-2                                                                                            # Weight of L2 regularization in critic's network - kernel
-breg_l1_C = 1e-2                                                                                            # Weight of L1 regularization in critic's network - bias
-breg_l2_C = 1e-2                                                                                            # Weight of L2 regularization in critic's network - bias
-
-### Buffer parameters
-prioritized_replay_alpha = 0                                                                                # α determines how much prioritization is used, set to 0 to use a normal buffer. Used to define the probability of sampling transition i --> P(i) = p_i**α / sum(p_k**α) where p_i is the priority of transition i 
-prioritized_replay_beta = 0.6          
-prioritized_replay_beta_iters = None                                                                        # Therefore let's exploit the flexibility of annealing the amount of IS correction over time, by defining a schedule on the exponent β that from its initial value β0 reaches 1 only at the end of learning.
-prioritized_replay_eps = 1e-2                                                                               # It's a small positive constant that prevents the edge-case of transitions not being revisited once their error is zero
-fresh_factor = 0.95                                                                                         # Refresh factor
+kreg_l2_C = 1e-3                                                                                            # Weight of L2 regularization in critic's network - kernel
+breg_l2_C = 1e-3                                                                                            # Weight of L2 regularization in critic's network - bias
 
 
 
@@ -109,6 +70,7 @@ w_u = 10                                                                        
 w_peak = 5e5                                                                                                # Target threshold weight
 w_ob = 5e6                                                                                                  # Obstacle weight
 w_v = 0                                                                                                     # Velocity weight
+w_b = 1e2                                                                                                   # Bound control weight
 weight = np.array([w_d, w_u, w_peak, w_ob, w_v])                                                            # Weights vector (tmp)
 cost_weights_running  = np.array([w_d, w_peak, 0., w_ob, w_ob, w_ob, w_u])                                  # Running cost weights vector
 cost_weights_terminal = np.array([w_d, w_peak, 0., w_ob, w_ob, w_ob, 0])                                    # Terminal cost weights vector 
@@ -123,6 +85,8 @@ offset_cost_fun = 0                                                             
 scale_cost_fun = 1e-5                                                                                       # Reward/cost scale factor (1e-5)                                                                       
 cost_funct_param = np.array([offset_cost_fun, scale_cost_fun])
 
+max_cost = 1e3                                                                                              # Max cost
+
 ### Target parameters
 x_des = -7.0                                                                                                # Target x position
 y_des = 0.0                                                                                                 # Target y position
@@ -131,7 +95,7 @@ TARGET_STATE = np.array([x_des,y_des])                                          
 
 
 ''' Path parameters '''
-test_set = 'set test'                                                                                          # Test id  
+test_set = 'set test - 1'                                                                                   # Test id  
 Config_path = './Results Single Integrator/Results {}/Configs/'.format(test_set)                            # Configuration path
 Fig_path = './Results Single Integrator/Results {}/Figures'.format(test_set)                                # Figure path
 NNs_path = './Results Single Integrator/Results {}/NNs'.format(test_set)                                    # NNs path
@@ -141,10 +105,10 @@ DictWS_path = './Results Single Integrator/Results {}/DictWS/'.format(test_set) 
 path_list = [Fig_path, NNs_path, Log_path, Code_path, DictWS_path]                                          # Path list
 
 # Recover-training parameters
-test_set_rec = 'set prova b'
-NNs_path_rec = './Results Single Integrator/Results {}/NNs'.format(test_set_rec)                            # NNs path recover training
-N_try_rec = 0
-update_step_counter_rec = 12000
+test_set_rec = None
+NNs_path_rec = './Results Single Integrator/Results set {}/NNs'.format(test_set_rec)                        # NNs path recover training
+N_try_rec = None
+update_step_counter_rec = None
 
 ''' System parameters ''' 
 env_RL = 0                                                                                                  # Flag RL environment: set True if RL_env and TO_env are different                                                                                 
@@ -156,8 +120,6 @@ simulate_coulomb_friction = 0                                                   
 simulation_type = 'euler'                                                                                   # Either 'timestepping' or 'euler'
 tau_coulomb_max = 0*np.ones(2)                                                                              # Expressed as percentage of torque max
 integration_scheme = 'E-Euler'                                                                              # TO integration scheme - Either 'E-Euler' or 'SI-Euler'
-
-
 
 ### State parameters 
 nb_state = 2 + 1                                                                                            # State size (robot state size +1)
@@ -188,7 +150,6 @@ tau_lower_bound = -6                                                            
 tau_upper_bound = 6                                                                                         # Action upper bound
 u_min = tau_lower_bound*np.ones(nb_action)                                                                  # Action lower bound vector
 u_max = tau_upper_bound*np.ones(nb_action)                                                                  # Action upper bound vector
-w_b = 1/w_u
 
 
 

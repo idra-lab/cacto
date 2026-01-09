@@ -8,12 +8,13 @@ import importlib
 import numpy as np
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' # {'0' -> show all logs, '1' -> filter out info, '2' -> filter out warnings}
 import tensorflow as tf
+import matplotlib.pyplot as plt
 from multiprocessing import Pool
 from RL import RL_AC 
 from TO import TO_Casadi 
 from plot_utils import PLOT
 from NeuralNetwork import NN
-from replay_buffer import PrioritizedReplayBuffer, ReplayBuffer
+from replay_buffer import ReplayBuffer
 
 def parse_args():
     ''' Parse the arguments for CACTO training '''
@@ -25,23 +26,30 @@ def parse_args():
     parser.add_argument('--seed',                           type=int,   default=0,                                    
                         help="random and tf.random seed")
 
-    parser.add_argument('--system-id',                      type=str,   default='single_integrator',
-                        choices=["single_integrator", "double_integrator", "car", "car_park", "manipulator", "ur5"],
-                        help="System-id (single_integrator, double_integrator, car, manipulator, ur5")
+    parser.add_argument('--system-id',                      type=str,   default='oneD',
+                        choices=["single_integrator", "double_integrator", "car", "manipulator", ],
+                        help="System-id (single_integrator, double_integrator, car, manipulator")
 
     parser.add_argument('--recover-training-flag',          type=bool,  default=False,
                         choices=["True", "False"],
                         help="Flag to recover training")
-    ### Not tested ###
-    #parser.add_argument('--GPU-flag',                       type=bool,  default=False,
-    #                    choices=["True", "False"],
-    #                    help="Flag to use GPU")
+
+    parser.add_argument('--GPU-flag',                       type=bool,  default=False,
+                        choices=["True", "False"],
+                        help="Flag to use GPU")
     
     parser.add_argument('--nb-cpus',                        type=int,   default=10,
                         help="Number of TO problems solved in parallel")
     
     parser.add_argument('--w-S',                            type=float, default=0,
-                        help="Sobolev training - weight of the value related error")
+                        help="Sobolev training - weight of the value related error (0 to disable Sobolev training)")
+
+    parser.add_argument('--BICSf',                            type=float, default=0.25,
+                        help="BICS factor")
+    
+    parser.add_argument('--plot-flag',                        type=int,  default=0,
+                        choices=[1, 0],
+                        help="Flag to plot results")
     
     args = parser.parse_args()
     dict_args = vars(args)
@@ -69,15 +77,19 @@ if __name__ == '__main__':
 
     recover_training_flag = args['recover_training_flag']
     
-    ### Not tested ###
-    #GPU_flag = args['GPU_flag'] 
-    #if GPU_flag:
-    #    os.environ["CUDA_VISIBLE_DEVICES"]="-1" 
-    #print(tf.config.experimental.list_physical_devices('GPU'))
-    
+    GPU_flag = args['GPU_flag'] 
+    if GPU_flag:
+        print(tf.config.experimental.list_physical_devices('GPU'))
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"]="-1" 
+
     nb_cpus = args['nb_cpus']
 
     w_S = args['w_S']
+
+    BICS_factor = args['BICSf']
+
+    plot_flag = args['plot_flag']
     #########################################################
 
 
@@ -87,9 +99,7 @@ if __name__ == '__main__':
         'single_integrator': ('conf_single_integrator', 'SingleIntegrator', 'SingleIntegrator_CAMS'),
         'double_integrator': ('conf_double_integrator', 'DoubleIntegrator', 'DoubleIntegrator_CAMS'),
         'car':               ('conf_car', 'Car', 'Car_CAMS'),
-        'car_park':          ('conf_car_park', 'CarPark', 'CarPark_CAMS'),
         'manipulator':       ('conf_manipulator', 'Manipulator', 'Manipulator_CAMS'),
-        'ur5':               ('conf_ur5', 'UR5', 'UR5_CAMS')
     }
     try:
         conf_module, env_class, env_TO_class = system_map[system_id]
@@ -133,8 +143,8 @@ if __name__ == '__main__':
     NN_inst = NN(env, conf, w_S)                                                                            # Create NN instance
     TrOp = TO_Casadi(env, conf, env_TO, w_S)                                                                # Create TO instance
     RLAC = RL_AC(env, NN_inst, conf, N_try)                                                                 # Create RL instance
-    buffer = ReplayBuffer(conf) if conf.prioritized_replay_alpha == 0 else PrioritizedReplayBuffer(conf)    # Create an empty (prioritized) replay buffer
-    plot_fun = PLOT(N_try, env, NN_inst, conf)                                                              # Create PLOT instance
+    buffer = ReplayBuffer(conf)                                                                             # Create an empty (prioritized) replay buffer
+    plot_fun = PLOT(N_try, env, env_TO, NN_inst, conf)                                                      # Create PLOT instance
 
     # Set initial weights of the NNs, initialize the counter of the updates and setup NN models
     if recover_training_flag:
@@ -150,31 +160,23 @@ if __name__ == '__main__':
     # Save initial weights of the NNs
     RLAC.RL_save_weights(update_step_counter)
 
-    # Plot initial rollouts
-    plot_fun.plot_traj_from_ICS(np.array(conf.init_states_sim), TrOp, RLAC, update_step_counter=update_step_counter,steps=conf.NSTEPS, init=0)
-
-    # Initialize arrays to store the reward history of each episode and the average reward history of last 100 episodes
-    ep_arr_idx = 0
-    ep_reward_arr = np.zeros(conf.NEPISODES-ep_arr_idx)*np.nan                                                                                     
-
     def compute_sample(args):
         ''' Create samples solving TO problems starting from given ICS '''
         ep = args[0]
         ICS = args[1]
 
         # Create initial TO #
-        init_rand_state, init_TO_states, init_TO_controls, NSTEPS_SH, success_init_flag = RLAC.create_TO_init(ep, ICS)
+        init_rand_state, init_TO_states, init_TO_controls, NSTEPS_SH, success_init_flag = RLAC.create_TO_init(TrOp, ep, ICS)
         if success_init_flag == 0:
             return None
-            
+
         # Solve TO problem #
         TO_controls, TO_states, success_flag, TO_ee_pos_arr, TO_step_cost, dVdx = TrOp.TO_Solve(init_rand_state, init_TO_states, init_TO_controls, NSTEPS_SH)
         if success_flag == 0:
             return None
-        
-        # Collect experiences 
-        state_arr, partial_reward_to_go_arr, total_reward_to_go_arr, state_next_rollout_arr, done_arr, rwrd_arr, term_arr, ep_return, RL_ee_pos_arr  = RLAC.RL_Solve(TO_controls, TO_states, TO_step_cost)
-
+                
+        # Collect experiences #
+        state_arr, partial_reward_to_go_arr, state_next_rollout_arr, done_arr, rwrd_arr, term_arr, ep_return, RL_ee_pos_arr  = RLAC.RL_Solve(TO_controls, TO_states, TO_step_cost)
         if conf.env_RL == 0:
             RL_ee_pos_arr = TO_ee_pos_arr
 
@@ -184,6 +186,13 @@ if __name__ == '__main__':
         ''' Create n uniformely distributed ICS '''
         # Create ICS TO #
         init_rand_state = env.reset()
+        
+        return init_rand_state
+
+    def create_biased_TO_init(n_BICS=1):
+        ''' Create n uniformely distributed ICS '''
+        # Create ICS TO #
+        init_rand_state = env.reset_biased(n_BICS, 10, NN_inst, RLAC)
         
         return init_rand_state
     
@@ -197,38 +206,54 @@ if __name__ == '__main__':
         profiler.enable()
 
     time_start = time.time()
-
     for ep in range(conf.NLOOPS): 
+    
         # Generate and store conf.EP_UPDATE random-uniform ICS
-        with Pool(nb_cpus) as p: 
-            init_rand_state = p.map(create_unif_TO_init, range(conf.EP_UPDATE))
+        if ep > 0 and BICS_factor > 0:
+            print('BICS')
+            EP_UPDATE = int(BICS_factor*conf.EP_UPDATE)
+            init_rand_state, std_values, init_rand_state_tmp = create_biased_TO_init(EP_UPDATE)
+
+        else:
+            init_rand_state_tmp = None
+            EP_UPDATE = conf.EP_UPDATE
+            with Pool(nb_cpus) as p: 
+                init_rand_state = p.map(create_unif_TO_init, range(EP_UPDATE))
+
+        if plot_flag:
+            plot_fun.plot_ICS(init_rand_state, name='ICS_{}'.format(ep))
 
         # Generate samples
+        t_s = time.time()
         with Pool(nb_cpus) as p: 
-            tmp = p.map(compute_sample, zip(ep*np.ones(conf.EP_UPDATE), init_rand_state))
-            
+            tmp = p.map(compute_sample, zip(ep*np.ones(EP_UPDATE), init_rand_state))
+        print("Time TO + prepare data: ", time.time()-t_s)
+
         # Remove unsuccessful TO problems and update EP_UPDATE
+        t_s = time.time()
         tmp = [x for x in tmp if x is not None]
         NSTEPS_SH, TO_controls, ee_pos_arr_TO, dVdx, state_arr, partial_reward_to_go_arr, state_next_rollout_arr, done_arr, rwrd_arr, term_arr, ep_return, ee_pos_arr_RL = zip(*tmp)
-
+        
+        data = np.concatenate(( np.concatenate(state_arr, axis=0), np.concatenate(partial_reward_to_go_arr, axis=0).reshape(-1,1), np.concatenate(state_next_rollout_arr, axis=0),
+                                np.concatenate(dVdx, axis=0), np.concatenate(done_arr, axis=0).reshape(-1,1), np.concatenate(term_arr, axis=0).reshape(-1,1)), axis=1)
+        
         # Update the buffer
-        buffer.add(state_arr, partial_reward_to_go_arr, state_next_rollout_arr, dVdx, done_arr, term_arr)
+        buffer.add(data)
+        print('Time post process + buffer: ', time.time()-t_s)
 
         # Update NNs
-        update_step_counter = RLAC.learn_and_update(update_step_counter, buffer, ep)
-
+        t_s = time.time()
+        update_step_counter = RLAC.learn_and_update(update_step_counter, buffer, ep, BICS_factor, plot_fun=plot_fun)
+        print("Time NN update: ", time.time()-t_s)
+        
         # plot Critic value function
-        #plot_fun.plot_Critic_Value_function(RLAC.critic_model, update_step_counter, system_id) ###
+        #if plot_flag:
+        #    plot_fun.plot_Critic_Value_function(RLAC.std_critic_model, update_step_counter, system_id, name='V')
 
         # Plot rollouts and state and control trajectories
-        if update_step_counter%conf.plot_rollout_interval_diff_loc == 0 or system_id == 'single_integrator' or system_id == 'double_integrator' or system_id == 'car_park' or system_id == 'car' or system_id == 'manipulator':
+        if plot_flag:
             print("System: {} - N_try = {}".format(conf.system_id, N_try))
-            plot_fun.plot_Critic_Value_function(RLAC.critic_model, update_step_counter, system_id)
-            plot_fun.plot_traj_from_ICS(np.array(conf.init_states_sim), TrOp, RLAC, update_step_counter=update_step_counter, ep=ep,steps=conf.NSTEPS, init=1)
-
-        # Update arrays to store the reward history and its average
-        ep_reward_arr[ep_arr_idx:ep_arr_idx+len(tmp)] = ep_return
-        ep_arr_idx += len(tmp)
+            plot_fun.plot_traj_from_ICS(np.array(conf.init_states_sim), TrOp, RLAC, update_step_counter=update_step_counter, ep=ep,steps=conf.NSTEPS, init=1,NN_inst=NN_inst, ICS=init_rand_state)
 
         for i in range(len(tmp)):
             print("Episode  {}  --->   Return = {}".format(ep*len(tmp) + i, ep_return[i]))
@@ -243,9 +268,6 @@ if __name__ == '__main__':
         profiler.disable()
         stats = pstats.Stats(profiler).sort_stats('cumtime')
         stats.print_stats()
-
-    # Plot returns
-    plot_fun.plot_Return(ep_reward_arr)
 
     # Save networks at the end of the training
     RLAC.RL_save_weights()
