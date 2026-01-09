@@ -1,0 +1,93 @@
+<?xml version="1.0"?>
+<robot name="reacher">
+
+  <link name="world"/>
+
+  <joint name="fixed_world" type="fixed">
+    <parent link="world"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Base (root capsule) -->
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <cylinder radius="0.011" length="0.02"/>
+      </geometry>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <material name="brown"/>
+    </visual>
+    <inertial>
+      <mass value="0.0132"/>
+      <inertia ixx="1.3e-6" iyy="1.3e-6" izz="6.0e-7" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+
+  <!-- Joint0 + Link0 -->
+  <joint name="joint0" type="revolute" armature="1" damping="1" limited="false">
+    <parent link="base_link"/>
+    <child link="link0"/>
+    <origin xyz="0 0 0.0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="10" velocity="5"/>
+    <dynamics damping="1.0" friction="0.0"/>
+  </joint>
+
+  <link name="link0">
+    <visual>
+      <geometry>
+        <cylinder radius="0.01" length="0.1"/>
+      </geometry>
+      <origin xyz="0.05 0 0" rpy="0 90 0"/>
+      <material name="blue"/>
+    </visual>
+    <inertial>
+      <mass value="0.0356"/>
+      <inertia ixx="3.1e-5" iyy="3.1e-5" izz="1.8e-6" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+
+  <!-- Joint1 + Link1 -->
+  <joint name="joint1" type="revolute" armature="1" damping="1" limited="true">
+    <parent link="link0"/>
+    <child link="link1"/>
+    <origin xyz="0.1 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.0" upper="3.0" effort="10" velocity="5"/>
+  </joint>
+
+  <link name="link1">
+    <visual>
+      <geometry>
+        <cylinder radius="0.01" length="0.1"/>
+      </geometry>
+      <origin xyz="0.05 0 0" rpy="0 90 0"/>
+      <material name="blue"/>
+    </visual>
+    <inertial>
+      <mass value="0.0356"/>
+      <inertia ixx="3.1e-5" iyy="3.1e-5" izz="1.8e-6" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+
+  <!-- Fingertip -->
+  <joint name="fixed_ee" type="fixed">
+    <parent link="link1"/>
+    <child link="EE"/>
+    <origin xyz="0.11 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="EE">
+    <visual>
+      <geometry>
+        <sphere radius="0.01"/>
+      </geometry>
+      <material name="red"/>
+    </visual>
+    <inertial>
+      <mass value="0.00419"/>
+      <inertia ixx="1.7e-7" iyy="1.7e-7" izz="1.7e-7" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+</robot>
